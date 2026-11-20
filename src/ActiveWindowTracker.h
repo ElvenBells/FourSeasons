@@ -1,6 +1,9 @@
 #pragma once
 
+#include "SnowSurface.h"
+
 #include <QObject>
+#include <QList>
 #include <QRect>
 #include <QString>
 
@@ -40,4 +43,7 @@ Q_SIGNALS:
     // логических координатах экрана. Пустой QRect — активного окна нет
     // (рабочий стол, панель, окно оверлея и т.п.).
     void activeRectChanged(const QRect &globalRect);
+    // Видимые окна и панели текущего рабочего стола, снизу вверх.
+    void surfacesChanged(const QList<SnowSurface> &surfaces);
+    void cursorPosChanged(const QPoint &globalPosition);
 };

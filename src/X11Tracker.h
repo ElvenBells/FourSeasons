@@ -26,9 +26,11 @@ public:
 
 private Q_SLOTS:
     void poll();
+    void pollSurfaces();
 
 private:
     QRect queryActiveFrame() const;
+    QRect queryFrame(unsigned long window, bool dock) const;
 
     _XDisplay *m_dpy = nullptr;
     unsigned long m_root = 0;
@@ -37,6 +39,15 @@ private:
     unsigned long m_atomType = 0;
     unsigned long m_atomTypeDesktop = 0;
     unsigned long m_atomTypeDock = 0;
+    unsigned long m_atomClientList = 0;
+    unsigned long m_atomStacking = 0;
+    unsigned long m_atomState = 0;
+    unsigned long m_atomHidden = 0;
+    unsigned long m_atomDesktop = 0;
+    unsigned long m_atomCurrentDesktop = 0;
+    QList<long> m_windowTypes;
     QTimer m_timer;
+    QTimer m_surfaceTimer;
     QRect m_last;
+    QList<SnowSurface> m_surfaces;
 };

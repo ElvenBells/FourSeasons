@@ -6,9 +6,12 @@
 #include <QDBusMessage>
 #include <QDebug>
 #include <QDir>
-#include <QFile>
+#include <QEventLoop>
+#include <QGuiApplication>
 #include <QStandardPaths>
 #include <QStringList>
+#include <QTemporaryFile>
+#include <QUuid>
 
 namespace {
 
@@ -47,13 +50,24 @@ const char kScriptTemplate[] = R"JS(
     var IFACE   = "@IFACE@";
     var APP_ID  = "@APPID@";
     var TITLE   = "@TITLE@";
+    var TOKEN   = "@TOKEN@";
+    var TRACK_CURSOR = @TRACKCURSOR@;
     var OVERLAY = { x: @OX@, y: @OY@, width: @OW@, height: @OH@ };
 
     var W = workspace;
     var watched = [];        // окна, на сигналы которых мы уже подписаны
+    var windowIds = [];
+    var nextId = 1;
     var lastActive = null;   // последнее активное окно, не являющееся оверлеем
     var lastMsg = "";
-    var guard = false;
+    var focusTimer = new QTimer();
+    focusTimer.singleShot = true;
+    var geometryTimer = new QTimer();
+    geometryTimer.singleShot = true;
+    var cursorTimer = new QTimer();
+    cursorTimer.singleShot = true;
+    var cursorAreas = [];
+    var cursorNearSnow = false;
 
     // ---- совместимость: Plasma 5.27 (client*) и Plasma 6 (window*) ----
     function getActive()  { return (W.activeWindow !== undefined) ? W.activeWindow : W.activeClient; }
@@ -81,22 +95,71 @@ const char kScriptTemplate[] = R"JS(
     function onCurrentDesktop(c) {
         if (c.onAllDesktops) return true;
         if (typeof W.currentDesktop === "number") return c.desktop === W.currentDesktop;   // Plasma 5
+        if (!c.desktops) return true;
         for (var i = 0; i < c.desktops.length; ++i)                                         // Plasma 6
             if (c.desktops[i] === W.currentDesktop) return true;
         return false;
     }
 
+    function geometry(w) {
+        var g = w.frameGeometry || w.geometry;
+        if (!g || g.width < 1 || g.height < 1) return "0";
+        return "1," + Math.round(g.x) + "," + Math.round(g.y) + ","
+            + Math.round(g.width) + "," + Math.round(g.height);
+    }
+
     function send(w) {
-        var msg = "0";
-        if (!isIgnored(w)) {
-            var g = w.frameGeometry || w.geometry;   // рамка и заголовок включены
-            if (g && g.width > 0 && g.height > 0)
-                msg = "1," + Math.round(g.x) + "," + Math.round(g.y) + ","
-                    + Math.round(g.width) + "," + Math.round(g.height);
+        var parts = [isIgnored(w) ? "0" : geometry(w)];
+        var areas = [];
+        var order = W.stackingOrder;
+        if (!order || !order.length) {
+            order = watched.slice();
+            var activeIndex = order.indexOf(w);
+            if (activeIndex >= 0) order.push(order.splice(activeIndex, 1)[0]);
         }
+        for (var i = 0; i < order.length; ++i) {
+            var client = order[i];
+            var index = watched.indexOf(client);
+            if (index < 0 || isOverlay(client) || client.minimized || client.hidden || client.deleted)
+                continue;
+            if (!client.dock && (client.desktopWindow || client.specialWindow || !onCurrentDesktop(client)))
+                continue;
+            var rect = geometry(client);
+            if (rect !== "0") {
+                parts.push((client.dock ? "D" : "W") + windowIds[index] + ":" + rect);
+                if (TRACK_CURSOR && !client.dock) {
+                    var frame = client.frameGeometry || client.geometry;
+                    if (frame.y >= OVERLAY.y + 3 && frame.y < OVERLAY.y + OVERLAY.height)
+                        areas.push(frame);
+                }
+            }
+        }
+        cursorAreas = areas;
+        var msg = parts.join(";");
         if (msg === lastMsg) return;
         lastMsg = msg;
-        callDBus(SERVICE, PATH, IFACE, "geometryMessage", msg);
+        callDBus(SERVICE, PATH, IFACE, "geometryMessage", TOKEN, msg);
+    }
+
+    function scheduleGeometry() {
+        if (!geometryTimer.active)
+            geometryTimer.start(16);
+    }
+
+    function reportCursor() {
+        var p = W.cursorPos;
+        if (!p) return;
+        var near = false;
+        for (var i = 0; i < cursorAreas.length; ++i) {
+            var r = cursorAreas[i];
+            if (p.x >= r.x && p.x < r.x + r.width && p.y >= r.y - 32 && p.y <= r.y + 2) {
+                near = true;
+                break;
+            }
+        }
+        if (near || cursorNearSnow)
+            callDBus(SERVICE, PATH, IFACE, "cursorMessage", TOKEN, Math.round(p.x) + "," + Math.round(p.y));
+        cursorNearSnow = near;
     }
 
     // Прижимаем окно оверлея: поверх всех, без панели задач, на весь экран.
@@ -118,25 +181,43 @@ const char kScriptTemplate[] = R"JS(
     function watch(w) {
         if (!w || watched.indexOf(w) >= 0) return;
         watched.push(w);
-        // Геометрию шлём только для активного окна: при перетаскивании «дырка» едет следом.
-        if (w.frameGeometryChanged)
-            w.frameGeometryChanged.connect(function () { if (w === getActive()) send(w); });
-        if (w.minimizedChanged)
-            w.minimizedChanged.connect(function () { if (w === getActive()) send(w); });
+        var id = str(w.internalId);
+        windowIds.push(/^\{?[0-9a-fA-F-]{36}\}?$/.test(id) ? id : TOKEN + "-" + nextId++);
+        if (isOverlay(w)) return;
+        function changed() {
+            var active = getActive();
+            if (w === active) send(active);
+            else scheduleGeometry();
+        }
+        if (w.frameGeometryChanged) w.frameGeometryChanged.connect(changed);
+        if (w.minimizedChanged) w.minimizedChanged.connect(changed);
+        if (w.hiddenChanged) w.hiddenChanged.connect(scheduleGeometry);
+        if (w.desktopsChanged) w.desktopsChanged.connect(scheduleGeometry);
+        if (w.stackingOrderChanged) w.stackingOrderChanged.connect(scheduleGeometry);
+    }
+
+    function settleFocus() {
+        var a = getActive();
+        if (isOverlay(a) && lastActive && !lastActive.minimized && onCurrentDesktop(lastActive)) {
+            setActive(lastActive);
+            if (!isOverlay(getActive()))
+                return;
+        }
+        if (!a || isOverlay(a)) {
+            lastActive = null;
+            send(null);
+        }
     }
 
     function onActivated() {
         var a = getActive();
-        if (isOverlay(a)) {
-            // Оверлей не должен владеть фокусом: возвращаем его прежнему окну
-            // (только если оно на текущем рабочем столе — иначе KWin переключит стол).
-            if (!guard && lastActive && !lastActive.minimized && onCurrentDesktop(lastActive)) {
-                guard = true;
-                try { setActive(lastActive); } catch (e) {}
-                guard = false;
-            }
+        // KWin может сначала прислать null, а затем активировать оверлей.
+        // Сохраняем предыдущее окно до конца текущего переключения фокуса.
+        if (!a || isOverlay(a)) {
+            focusTimer.start(0);
             return;
         }
+        focusTimer.stop();
         lastActive = a;
         watch(a);
         send(a);
@@ -145,12 +226,17 @@ const char kScriptTemplate[] = R"JS(
     function onAdded(w) {
         watch(w);
         if (isOverlay(w)) setupOverlay(w);
+        else scheduleGeometry();
     }
 
     function onRemoved(w) {
         if (w === lastActive) lastActive = null;
         var i = watched.indexOf(w);
-        if (i >= 0) watched.splice(i, 1);
+        if (i >= 0) {
+            watched.splice(i, 1);
+            windowIds.splice(i, 1);
+            scheduleGeometry();
+        }
     }
 
     // ---- старт ----
@@ -162,6 +248,19 @@ const char kScriptTemplate[] = R"JS(
     sigAdded.connect(onAdded);
     sigRemoved.connect(onRemoved);
     sigActivated.connect(onActivated);
+    W.currentDesktopChanged.connect(function () { send(getActive()); });
+    focusTimer.timeout.connect(settleFocus);
+    geometryTimer.timeout.connect(function () {
+        var active = getActive();
+        send(isOverlay(active) ? lastActive : active);
+    });
+    if (TRACK_CURSOR && W.cursorPosChanged) {
+        cursorTimer.timeout.connect(reportCursor);
+        W.cursorPosChanged.connect(function () {
+            if (!cursorTimer.active)
+                cursorTimer.start(32);
+        });
+    }
 
     var a0 = getActive();
     if (!isOverlay(a0)) lastActive = a0;
@@ -177,6 +276,8 @@ const char kScriptTemplate[] = R"JS(
 KWinTracker::KWinTracker(QObject *parent)
     : ActiveWindowTracker(parent)
 {
+    m_reloadTimer.setSingleShot(true);
+    connect(&m_reloadTimer, &QTimer::timeout, this, &KWinTracker::reloadScript);
 }
 
 KWinTracker::~KWinTracker()
@@ -189,11 +290,24 @@ void KWinTracker::setOverlayGeometry(const QRect &globalRect)
     if (m_overlay == globalRect)
         return;
     m_overlay = globalRect;
-    // Экран изменился уже после запуска — перезагружаем скрипт с новой геометрией.
-    if (m_scriptLoaded) {
-        unloadScript();
-        loadScript();
+    if (m_scriptLoaded)
+        m_reloadTimer.start(0);
+}
+
+void KWinTracker::reloadScript()
+{
+    unloadScript();
+    if (!loadScript()) {
+        m_activeRect = {};
+        m_surfaces.clear();
     }
+    publishGeometry();
+}
+
+void KWinTracker::publishGeometry()
+{
+    emit activeRectChanged(m_activeRect);
+    emit surfacesChanged(m_surfaces);
 }
 
 bool KWinTracker::start()
@@ -219,10 +333,17 @@ bool KWinTracker::start()
     }
     m_dbusRegistered = true;
 
+    // Удаляем скрипт, который мог остаться в KWin после аварийного выхода.
+    unloadScript();
     if (!loadScript()) {
         stop();
         return false;
     }
+    // Фабрика подключает получателя activeRectChanged после возврата из start().
+    QTimer::singleShot(0, this, [this] {
+        if (m_scriptLoaded)
+            publishGeometry();
+    });
     return true;
 }
 
@@ -234,6 +355,9 @@ QString KWinTracker::buildScript() const
     s.replace(QStringLiteral("@IFACE@"), kInterface);
     s.replace(QStringLiteral("@APPID@"), QString::fromLatin1(SnowIds::kAppId));
     s.replace(QStringLiteral("@TITLE@"), QString::fromLatin1(SnowIds::kWindowTitle));
+    s.replace(QStringLiteral("@TOKEN@"), m_scriptToken);
+    s.replace(QStringLiteral("@TRACKCURSOR@"), QGuiApplication::platformName().startsWith(QLatin1String("wayland"))
+              ? QStringLiteral("true") : QStringLiteral("false"));
     s.replace(QStringLiteral("@OX@"), QString::number(m_overlay.x()));
     s.replace(QStringLiteral("@OY@"), QString::number(m_overlay.y()));
     s.replace(QStringLiteral("@OW@"), QString::number(m_overlay.width()));
@@ -247,21 +371,19 @@ bool KWinTracker::loadScript()
     QString dir = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
     if (dir.isEmpty())
         dir = QDir::tempPath();
-    m_scriptPath = dir + QStringLiteral("/snowoverlay-kwin-tracker.js");
-
-    QFile file(m_scriptPath);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        qWarning() << "[SnowOverlay] Не могу записать KWin-скрипт:" << m_scriptPath;
+    QTemporaryFile file(QDir(dir).filePath(QStringLiteral("snowoverlay-kwin-tracker-XXXXXX.js")));
+    const QRect scriptGeometry = m_overlay;
+    m_scriptToken = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    m_receivedInitialGeometry = false;
+    const QByteArray script = buildScript().toUtf8();
+    if (!file.open() || file.write(script) != script.size() || !file.flush()) {
+        qWarning() << "[SnowOverlay] Не могу записать KWin-скрипт:" << file.errorString();
         return false;
     }
-    file.write(buildScript().toUtf8());
     file.close();
 
-    // Остался скрипт от прошлого запуска (например, после падения)? Выгружаем.
-    callKWin(kScriptingPath, kScriptingIface, QStringLiteral("unloadScript"), {kPluginName});
-
     const QDBusMessage reply = callKWin(kScriptingPath, kScriptingIface,
-                                        QStringLiteral("loadScript"), {m_scriptPath, kPluginName});
+                                        QStringLiteral("loadScript"), {file.fileName(), kPluginName});
     if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().isEmpty()) {
         qWarning() << "[SnowOverlay] KWin не принял скрипт:" << reply.errorMessage();
         return false;
@@ -291,24 +413,41 @@ bool KWinTracker::loadScript()
         return false;
     }
 
+    // run() может ответить успехом даже после ошибки выполнения JavaScript.
+    // Скрипт подтверждает запуск первой геометрией после подключения сигналов.
+    if (!m_receivedInitialGeometry) {
+        QEventLoop loop;
+        QTimer timeout;
+        timeout.setSingleShot(true);
+        connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
+        connect(this, &KWinTracker::initialGeometryReceived, &loop, &QEventLoop::quit);
+        timeout.start(1000);
+        loop.exec(QEventLoop::ExcludeUserInputEvents);
+    }
+    if (!m_receivedInitialGeometry) {
+        qWarning() << "[SnowOverlay] Скрипт KWin не подтвердил запуск.";
+        unloadScript();
+        return false;
+    }
+
     m_scriptLoaded = true;
+    if (m_overlay != scriptGeometry)
+        m_reloadTimer.start(0);
     return true;
 }
 
 void KWinTracker::unloadScript()
 {
-    callKWin(kScriptingPath, kScriptingIface, QStringLiteral("unloadScript"), {kPluginName});
     m_scriptLoaded = false;
+    m_scriptToken.clear();
+    callKWin(kScriptingPath, kScriptingIface, QStringLiteral("unloadScript"), {kPluginName});
 }
 
 void KWinTracker::stop()
 {
+    m_reloadTimer.stop();
     if (m_scriptLoaded)
         unloadScript();
-    if (!m_scriptPath.isEmpty()) {
-        QFile::remove(m_scriptPath);
-        m_scriptPath.clear();
-    }
     if (m_dbusRegistered) {
         QDBusConnection bus = QDBusConnection::sessionBus();
         bus.unregisterObject(kPath);
@@ -317,13 +456,63 @@ void KWinTracker::stop()
     }
 }
 
-void KWinTracker::geometryMessage(const QString &message)
+static QRect parseRect(const QString &message)
 {
-    const QStringList p = message.split(QLatin1Char(','));
-    if (p.size() == 5 && p.at(0) == QLatin1String("1")) {
-        emit activeRectChanged(QRect(p.at(1).toInt(), p.at(2).toInt(),
-                                     p.at(3).toInt(), p.at(4).toInt()));
-    } else {
-        emit activeRectChanged(QRect()); // активного окна нет → снег по всему экрану
+    const QStringList parts = message.split(QLatin1Char(','));
+    if (parts.size() != 5 || parts.at(0) != QLatin1String("1"))
+        return {};
+    bool xOk, yOk, widthOk, heightOk;
+    const int x = parts.at(1).toInt(&xOk);
+    const int y = parts.at(2).toInt(&yOk);
+    const int width = parts.at(3).toInt(&widthOk);
+    const int height = parts.at(4).toInt(&heightOk);
+    if (!xOk || !yOk || !widthOk || !heightOk || width <= 0 || height <= 0)
+        return {};
+    return QRect(x, y, width, height);
+}
+
+void KWinTracker::geometryMessage(const QString &scriptToken, const QString &message)
+{
+    if (m_scriptToken.isEmpty() || scriptToken != m_scriptToken)
+        return;
+    const QStringList parts = message.split(QLatin1Char(';'));
+    const QRect activeRect = parseRect(parts.first());
+    if (activeRect.isEmpty() && parts.first() != QLatin1String("0"))
+        return;
+    QList<SnowSurface> surfaces;
+    for (qsizetype i = 1; i < parts.size(); ++i) {
+        const QString &entry = parts.at(i);
+        const qsizetype separator = entry.indexOf(QLatin1Char(':'));
+        if (separator <= 1 || (entry.front() != QLatin1Char('D') && entry.front() != QLatin1Char('W')))
+            continue;
+        const QRect rect = parseRect(entry.mid(separator + 1));
+        if (!rect.isEmpty())
+            surfaces.append({entry.mid(1, separator - 1), rect, entry.front() == QLatin1Char('D')});
     }
+    const bool activeChanged = m_activeRect != activeRect;
+    const bool surfacesUpdated = m_surfaces != surfaces;
+    m_activeRect = activeRect;
+    m_surfaces = surfaces;
+    if (!m_receivedInitialGeometry) {
+        m_receivedInitialGeometry = true;
+        emit initialGeometryReceived();
+    }
+    if (m_scriptLoaded && activeChanged)
+        emit activeRectChanged(m_activeRect);
+    if (m_scriptLoaded && surfacesUpdated)
+        emit surfacesChanged(m_surfaces);
+}
+
+void KWinTracker::cursorMessage(const QString &scriptToken, const QString &message)
+{
+    if (!m_scriptLoaded || scriptToken != m_scriptToken)
+        return;
+    const qsizetype comma = message.indexOf(QLatin1Char(','));
+    if (comma < 0)
+        return;
+    bool xOk = false, yOk = false;
+    const int x = QStringView(message).left(comma).toInt(&xOk);
+    const int y = QStringView(message).mid(comma + 1).toInt(&yOk);
+    if (xOk && yOk)
+        emit cursorPosChanged(QPoint(x, y));
 }

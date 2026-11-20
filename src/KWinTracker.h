@@ -2,6 +2,8 @@
 
 #include "ActiveWindowTracker.h"
 
+#include <QTimer>
+
 // Бэкенд для KDE Plasma (KWin), работает и в Wayland-, и в X11-сессии.
 //
 // В Wayland приложение НЕ МОЖЕТ ни узнать геометрию чужих окон, ни само
@@ -30,15 +32,25 @@ public Q_SLOTS:
     // Вызывается из KWin-скрипта. Формат: "0" (нет активного окна)
     // или "1,x,y,w,h". Строка выбрана намеренно: типы чисел при передаче из JS
     // в D-Bus бывают разными (int/double), а строка проходит всегда.
-    Q_SCRIPTABLE void geometryMessage(const QString &message);
+    Q_SCRIPTABLE void geometryMessage(const QString &scriptToken, const QString &message);
+    Q_SCRIPTABLE void cursorMessage(const QString &scriptToken, const QString &message);
+
+Q_SIGNALS:
+    void initialGeometryReceived();
 
 private:
+    void reloadScript();
+    void publishGeometry();
     bool loadScript();
     void unloadScript();
     QString buildScript() const;
 
     QRect m_overlay;
-    QString m_scriptPath;
+    QRect m_activeRect;
+    QList<SnowSurface> m_surfaces;
+    QString m_scriptToken;
+    QTimer m_reloadTimer;
     bool m_dbusRegistered = false;
     bool m_scriptLoaded = false;
+    bool m_receivedInitialGeometry = false;
 };

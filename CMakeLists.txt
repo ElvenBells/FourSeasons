@@ -2,7 +2,7 @@
 #
 # Зависимости Debian 12:
 #   sudo apt install build-essential cmake pkg-config qt6-base-dev qt6-wayland \
-#                    libgl1-mesa-dev libx11-dev
+#                    libgl1-mesa-dev libx11-dev libxext-dev
 #
 cmake_minimum_required(VERSION 3.16)
 project(SnowOverlay VERSION 0.1.0 LANGUAGES CXX)
@@ -16,17 +16,27 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Debian 12 поставляет Qt 6.4.x
-find_package(Qt6 6.4 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 6.4 REQUIRED COMPONENTS Widgets Network)
 
 set(SNOW_SOURCES
     src/main.cpp
     src/Constants.h
     src/SnowWindow.h
     src/SnowWindow.cpp
+    src/SnowScene.h
+    src/SnowScene.cpp
+    src/SnowProps.h
+    src/SnowProps.cpp
+    src/SnowSurface.h
+    src/SnowCrystal.h
+    src/SnowCrystal.cpp
+    src/Season.h
+    src/AutumnWeather.h
+    src/AutumnWeather.cpp
     src/ActiveWindowTracker.h
     src/ActiveWindowTracker.cpp
 )
-set(SNOW_LIBS Qt6::Widgets)
+set(SNOW_LIBS Qt6::Widgets Qt6::Network)
 set(SNOW_DEFS "")
 
 # ---------------------------------------------------------------------------
@@ -40,17 +50,26 @@ if(UNIX AND NOT APPLE)
     list(APPEND SNOW_LIBS Qt6::DBus)
     list(APPEND SNOW_DEFS SNOW_HAS_KWIN)
 
+    # Xlib нужен для проверки композитора даже при отключённом трекере X11.
+    find_package(X11)
+    if(X11_FOUND)
+        list(APPEND SNOW_LIBS X11::X11)
+        list(APPEND SNOW_DEFS SNOW_HAS_XLIB)
+        if(TARGET X11::Xext)
+            list(APPEND SNOW_LIBS X11::Xext)
+            list(APPEND SNOW_DEFS SNOW_HAS_XSHAPE)
+        else()
+            message(WARNING "Xext не найден (libxext-dev) — управление мышью на X11 отключено")
+        endif()
+    else()
+        message(WARNING "Xlib не найден (libx11-dev) — запуск через xcb отключён")
+    endif()
+
     # Чистый X11 (Xlib, _NET_ACTIVE_WINDOW) — запасной бэкенд для не-KDE окружений
     option(SNOW_WITH_X11 "Собрать X11-бэкенд (Xlib)" ON)
-    if(SNOW_WITH_X11)
-        find_package(X11)
-        if(X11_FOUND)
-            list(APPEND SNOW_SOURCES src/X11Tracker.h src/X11Tracker.cpp)
-            list(APPEND SNOW_LIBS X11::X11)
-            list(APPEND SNOW_DEFS SNOW_HAS_X11)
-        else()
-            message(WARNING "Xlib не найден (libx11-dev) — X11-бэкенд отключён")
-        endif()
+    if(SNOW_WITH_X11 AND X11_FOUND)
+        list(APPEND SNOW_SOURCES src/X11Tracker.h src/X11Tracker.cpp)
+        list(APPEND SNOW_DEFS SNOW_HAS_X11)
     endif()
 endif()
 
@@ -63,3 +82,14 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 install(TARGETS SnowOverlay RUNTIME DESTINATION bin)
+
+include(CTest)
+if(BUILD_TESTING)
+    find_package(Qt6 6.4 QUIET COMPONENTS Test)
+    if(TARGET Qt6::Test)
+        add_executable(SnowSceneTest tests/SnowSceneTest.cpp src/SnowScene.cpp src/SnowCrystal.cpp src/SnowProps.cpp)
+        target_include_directories(SnowSceneTest PRIVATE src)
+        target_link_libraries(SnowSceneTest PRIVATE Qt6::Gui Qt6::Test)
+        add_test(NAME SnowSceneTest COMMAND SnowSceneTest)
+    endif()
+endif()
