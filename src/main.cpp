@@ -1,6 +1,5 @@
 #include "ActiveWindowTracker.h"
 #include "Constants.h"
-#include "Season.h"
 #include "SnowWindow.h"
 
 #include <QAction>
@@ -8,19 +7,26 @@
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QDebug>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
+#include <QFormLayout>
+#include <QHBoxLayout>
 #include <QIcon>
+#include <QLabel>
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QLockFile>
 #include <QMenu>
-#include <QPainter>
-#include <QPen>
-#include <QPixmap>
+#include <QPushButton>
 #include <QScreen>
+#include <QSettings>
+#include <QSlider>
 #include <QStandardPaths>
 #include <QSystemTrayIcon>
 #include <QTimer>
+
+#include <algorithm>
 
 #ifdef SNOW_HAS_XLIB
 #include <X11/Xlib.h>
@@ -56,41 +62,28 @@ static bool x11OverlaySupported()
     return false;
 }
 
-// Иконка в трее рисуется кодом: белая снежинка на синем круге (внешние файлы не нужны).
-static QIcon makeTrayIcon()
-{
-    QPixmap pm(64, 64);
-    pm.fill(Qt::transparent);
-
-    QPainter p(&pm);
-    p.setRenderHint(QPainter::Antialiasing, true);
-    p.setPen(Qt::NoPen);
-    p.setBrush(QColor(40, 110, 200));
-    p.drawEllipse(2, 2, 60, 60);
-
-    p.setPen(QPen(Qt::white, 4, Qt::SolidLine, Qt::RoundCap));
-    p.translate(32, 32);
-    for (int i = 0; i < 3; ++i) {      // три линии через центр = шесть лучей
-        p.drawLine(0, -22, 0, 22);
-        p.rotate(60);
-    }
-    p.end();
-
-    return QIcon(pm);
-}
+#ifdef SNOW_HAS_LAYER_SHELL
+int runPanelGarland(QApplication &app);
+#endif
 
 int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
+#ifdef SNOW_HAS_LAYER_SHELL
+    if (app.arguments().value(1) == QLatin1String("--panel-garland"))
+        return runPanelGarland(app);
+#endif
     QApplication::setApplicationName(QString::fromLatin1(SnowIds::kAppId));
     QApplication::setApplicationDisplayName(QStringLiteral("SnowOverlay"));
-    // app_id окна в Wayland берётся из desktopFileName — по нему KWin-скрипт найдёт оверлей.
+    // app_id окна в Wayland берётся из desktopFileName.
     QGuiApplication::setDesktopFileName(QString::fromLatin1(SnowIds::kAppId));
+    const QIcon applicationIcon(QStringLiteral(":/assets/snowoverlay.svg"));
+    app.setWindowIcon(applicationIcon);
     // Завершение через трей или команду --quit.
     QApplication::setQuitOnLastWindowClosed(false);
 
     QCommandLineParser parser;
-    parser.setApplicationDescription(QObject::tr("Снежный оверлей для рабочего стола"));
+    parser.setApplicationDescription(QObject::tr("Сезонный оверлей для рабочего стола"));
     parser.addHelpOption();
     const QCommandLineOption quitOption(QStringLiteral("quit"), QObject::tr("Завершить запущенный SnowOverlay."));
     parser.addOption(quitOption);
@@ -138,6 +131,65 @@ int main(int argc, char *argv[])
 
     // --- Окно со снегом ---------------------------------------------------
     SnowWindow window;
+    QSettings settings(QStringLiteral("FourSeasons"), app.applicationName());
+    const struct {
+        Season season;
+        const char *key;
+        QString label;
+    } seasons[] = {
+        {Season::Winter, "winter", QObject::tr("Зима")},
+        {Season::Spring, "spring", QObject::tr("Весна")},
+        {Season::Summer, "summer", QObject::tr("Лето")},
+        {Season::Autumn, "autumn", QObject::tr("Осень")},
+    };
+    const QString savedSeason = settings.value(QStringLiteral("season")).toString();
+    window.setAutumnOptions({settings.value(QStringLiteral("autumnRain"), false).toBool(),
+                             settings.value(QStringLiteral("autumnLeaves"), true).toBool()});
+    window.setSpringRain(settings.value(QStringLiteral("springRain"), false).toBool());
+    window.setBubbles(settings.value(QStringLiteral("summerBubbles"), false).toBool());
+    for (const auto &entry : seasons) {
+        if (savedSeason == QLatin1String(entry.key)) {
+            window.setSeason(entry.season);
+            break;
+        }
+    }
+    const bool garlandsEnabled = settings.value(QStringLiteral("garlandsEnabled"), true).toBool();
+    bool oldIntensityValid = false;
+    const int oldIntensity = settings.value(QStringLiteral("snowIntensity"), 2).toInt(&oldIntensityValid);
+    const int oldPresets[] = {0, 44, 100, 167};
+    const int defaultIntensity = oldIntensityValid && oldIntensity >= 0 && oldIntensity <= 3
+        ? oldPresets[oldIntensity] : 100;
+    const auto readSliderValue = [&settings](const QString &key, int fallback) {
+        bool valid = false;
+        const int percent = settings.value(key, fallback).toInt(&valid);
+        return valid ? percent : fallback;
+    };
+    using Precipitation::Settings;
+    QString previousPrefix = QStringLiteral("snow");
+    if (window.season() == Season::Spring)
+        previousPrefix = QStringLiteral("petal");
+    else if (window.season() == Season::Autumn)
+        previousPrefix = window.autumnOptions().leaves ? QStringLiteral("leaf") : QStringLiteral("rain");
+
+    const QString prefix = QStringLiteral("precipitation");
+    const auto loadSetting = [&](const QString &suffix, int fallback, int minimum, int maximum) {
+        return qBound(minimum, readSliderValue(prefix + suffix,
+                      readSliderValue(previousPrefix + suffix, readSliderValue(QStringLiteral("snow") + suffix, fallback))),
+                      maximum);
+    };
+    Settings precipitation{
+        loadSetting(QStringLiteral("IntensityPercent"), defaultIntensity, 0, SnowSettings::maxIntensity),
+        loadSetting(QStringLiteral("SpeedPercent"), 100, SnowSettings::minSpeed, SnowSettings::maxSpeed),
+        loadSetting(QStringLiteral("WindPercent"), 0, -SnowSettings::maxWind, SnowSettings::maxWind),
+    };
+    const auto applyPrecipitation = [&] {
+        window.setPrecipitation(precipitation);
+        settings.setValue(prefix + QStringLiteral("IntensityPercent"), precipitation.intensity);
+        settings.setValue(prefix + QStringLiteral("SpeedPercent"), precipitation.speed);
+        settings.setValue(prefix + QStringLiteral("WindPercent"), precipitation.wind);
+    };
+    applyPrecipitation();
+    window.setGarlandsEnabled(garlandsEnabled);
 
     // --- Определение активного окна (может быть nullptr — это нормально) ----
     ActiveWindowTracker *tracker = ActiveWindowTracker::create(&app, window.screenRect());
@@ -150,6 +202,9 @@ int main(int argc, char *argv[])
                          &window, &SnowWindow::setGlobalCursorPos);
         QObject::connect(&window, &SnowWindow::overlayGeometryChanged,
                          tracker, &ActiveWindowTracker::setOverlayGeometry);
+        QObject::connect(&window, &SnowWindow::seasonalCursorTrackingChanged,
+                         tracker, &ActiveWindowTracker::setSeasonalCursorTracking);
+        tracker->setSeasonalCursorTracking(window.season() != Season::Winter);
         // Корректно выгружаем KWin-скрипт при выходе.
         QObject::connect(&app, &QCoreApplication::aboutToQuit, tracker, &ActiveWindowTracker::stop);
     } else if (platform.startsWith(QLatin1String("wayland"))) {
@@ -185,63 +240,183 @@ int main(int argc, char *argv[])
         qInfo() << "[SnowOverlay] Системный трей недоступен. Для выхода: SnowOverlay --quit";
 
     QMenu trayMenu;
-
-    // Сезон: два взаимоисключающих пункта.
-    QActionGroup seasonGroup(&trayMenu);
-    seasonGroup.setExclusive(true);
-    QAction *winterAction = trayMenu.addAction(QObject::tr("Зима"));
-    QAction *autumnAction = trayMenu.addAction(QObject::tr("Осень"));
-    for (QAction *action : {winterAction, autumnAction}) {
-        action->setCheckable(true);
+    QMenu *seasonMenu = trayMenu.addMenu(QObject::tr("Время года"));
+    QActionGroup seasonGroup(seasonMenu);
+    for (const auto &entry : seasons) {
+        QAction *action = seasonMenu->addAction(entry.label);
         seasonGroup.addAction(action);
-    }
-    trayMenu.addSeparator();
-
-    // Осень: дождь и листопад включаются независимо (можно и то и другое).
-    QAction *rainAction = trayMenu.addAction(QObject::tr("Дождь"));
-    QAction *leavesAction = trayMenu.addAction(QObject::tr("Листопад"));
-    for (QAction *action : {rainAction, leavesAction})
         action->setCheckable(true);
-    const AutumnOptions autumnOptions = window.autumnOptions();
-    rainAction->setChecked(autumnOptions.rain);
-    leavesAction->setChecked(autumnOptions.leaves);
+        action->setChecked(window.season() == entry.season);
+        action->setData(QString::fromLatin1(entry.key));
+    }
+    QMenu *autumnMenu = trayMenu.addMenu(QObject::tr("Эффекты осени"));
+    QAction *rainAction = autumnMenu->addAction(QObject::tr("Дождь"));
+    QAction *leavesAction = autumnMenu->addAction(QObject::tr("Листопад"));
+    rainAction->setCheckable(true);
+    leavesAction->setCheckable(true);
+    const auto syncAutumnActions = [&] {
+        const AutumnOptions options = window.autumnOptions();
+        rainAction->setChecked(options.rain);
+        rainAction->setEnabled(!options.rain || options.leaves);
+        leavesAction->setChecked(options.leaves);
+        leavesAction->setEnabled(!options.leaves || options.rain);
+    };
+    const auto changeAutumnOptions = [&] {
+        window.setAutumnOptions({rainAction->isChecked(), leavesAction->isChecked()});
+        syncAutumnActions();
+        const AutumnOptions options = window.autumnOptions();
+        settings.setValue(QStringLiteral("autumnRain"), options.rain);
+        settings.setValue(QStringLiteral("autumnLeaves"), options.leaves);
+    };
+    syncAutumnActions();
+    QObject::connect(rainAction, &QAction::triggered, autumnMenu, changeAutumnOptions);
+    QObject::connect(leavesAction, &QAction::triggered, autumnMenu, changeAutumnOptions);
 
-    // Зима: снегоуборщик.
+    QMenu *springMenu = trayMenu.addMenu(QObject::tr("Весенний сад"));
+    QMenu *summerMenu = trayMenu.addMenu(QObject::tr("Летние эффекты"));
+    const auto addTool = [&window](QMenu *menu, const QString &label, SeasonTool tool) {
+        QAction *action = menu->addAction(label);
+        QObject::connect(action, &QAction::triggered, &window, [&window, tool] { window.setSeasonTool(tool); });
+    };
+    const auto addToggle = [&window, &settings](QMenu *menu, const QString &label, const QString &key,
+                                                void (SnowWindow::*apply)(bool)) {
+        QAction *action = menu->addAction(label);
+        action->setCheckable(true);
+        action->setChecked(!key.isEmpty() && settings.value(key, false).toBool());
+        QObject::connect(action, &QAction::toggled, &window, [&window, &settings, key, apply](bool enabled) {
+            (window.*apply)(enabled);
+            if (!key.isEmpty())
+                settings.setValue(key, enabled);
+        });
+        return action;
+    };
+    autumnMenu->addSeparator();
+    addTool(autumnMenu, QObject::tr("Мести листья"), SeasonTool::Broom);
+    addTool(autumnMenu, QObject::tr("Сгрести листья"), SeasonTool::Rake);
+    QAction *blower = autumnMenu->addAction(QObject::tr("Вызвать воздуходувку"));
+    QObject::connect(blower, &QAction::triggered, &window, &SnowWindow::startLeafBlower);
+    addTool(autumnMenu, QObject::tr("Приготовить жёлудь"), SeasonTool::Acorn);
+    QAction *autumnBoat = autumnMenu->addAction(QObject::tr("Пустить бумажный кораблик"));
+    addTool(autumnMenu, QObject::tr("Убрать инструмент"), SeasonTool::Passive);
+
+    addToggle(springMenu, QObject::tr("Весенний дождь"), QStringLiteral("springRain"), &SnowWindow::setSpringRain);
+    addTool(springMenu, QObject::tr("Посадить семена"), SeasonTool::Plant);
+    addTool(springMenu, QObject::tr("Полить цветы"), SeasonTool::Water);
+    QAction *springBoat = springMenu->addAction(QObject::tr("Пустить бумажный кораблик"));
+    addTool(springMenu, QObject::tr("Убрать инструмент"), SeasonTool::Passive);
+
+    addToggle(summerMenu, QObject::tr("Мыльные пузыри"), QStringLiteral("summerBubbles"), &SnowWindow::setBubbles);
+    QAction *fan = addToggle(summerMenu, QObject::tr("Вентилятор"), {}, &SnowWindow::setSeasonFan);
+    QAction *jar = addToggle(summerMenu, QObject::tr("Банка для светлячков"), {}, &SnowWindow::setFireflyJar);
+    addTool(summerMenu, QObject::tr("Полить цветы"), SeasonTool::Water);
+    addTool(summerMenu, QObject::tr("Убрать инструмент"), SeasonTool::Passive);
+
+    QMenu *settingsMenu = trayMenu.addMenu(QObject::tr("Настройки"));
+    QAction *garlandsAction = settingsMenu->addAction(QObject::tr("Гирлянды"));
+    garlandsAction->setCheckable(true);
+    garlandsAction->setChecked(garlandsEnabled);
+    QObject::connect(garlandsAction, &QAction::toggled, &window, [&window, &settings](bool enabled) {
+        window.setGarlandsEnabled(enabled);
+        settings.setValue(QStringLiteral("garlandsEnabled"), enabled);
+    });
+
+    QDialog precipitationDialog;
+    precipitationDialog.setWindowTitle(QObject::tr("Настройки осадков"));
+    precipitationDialog.setWindowIcon(applicationIcon);
+    precipitationDialog.setMinimumWidth(420);
+    QFormLayout form(&precipitationDialog);
+    const auto addSlider = [&](const QString &title, int minimum, int maximum, int Settings::*member) {
+        auto *row = new QHBoxLayout;
+        auto *slider = new QSlider(Qt::Horizontal);
+        slider->setAccessibleName(title);
+        slider->setRange(minimum, maximum);
+        slider->setValue(precipitation.*member);
+        const auto format = [minimum](int value) {
+            if (minimum >= 0)
+                return QObject::tr("%1%").arg(value);
+            if (value == 0)
+                return QObject::tr("Штиль");
+            return value < 0 ? QObject::tr("← %1%").arg(-value) : QObject::tr("→ %1%").arg(value);
+        };
+        auto *label = new QLabel(format(slider->value()));
+        label->setMinimumWidth(std::max({label->fontMetrics().horizontalAdvance(format(minimum)),
+                                         label->fontMetrics().horizontalAdvance(format(0)),
+                                         label->fontMetrics().horizontalAdvance(format(maximum))}));
+        row->addWidget(slider, 1);
+        row->addWidget(label);
+        form.addRow(title, row);
+        QObject::connect(slider, &QSlider::valueChanged, &precipitationDialog,
+                         [&precipitation, &applyPrecipitation, label, member, format](int value) {
+            precipitation.*member = value;
+            applyPrecipitation();
+            label->setText(format(value));
+        });
+    };
+    addSlider(QObject::tr("Интенсивность"), 0, SnowSettings::maxIntensity, &Settings::intensity);
+    addSlider(QObject::tr("Скорость падения"), SnowSettings::minSpeed, SnowSettings::maxSpeed, &Settings::speed);
+    addSlider(QObject::tr("Ветер"), -SnowSettings::maxWind, SnowSettings::maxWind, &Settings::wind);
+    QDialogButtonBox buttons(QDialogButtonBox::Close);
+    buttons.button(QDialogButtonBox::Close)->setText(QObject::tr("Закрыть"));
+    form.addRow(&buttons);
+    QObject::connect(&buttons, &QDialogButtonBox::rejected, &precipitationDialog, &QDialog::close);
+    QAction *precipitationAction = settingsMenu->addAction(QObject::tr("Настройки осадков…"));
+    QObject::connect(precipitationAction, &QAction::triggered, &precipitationDialog, [&] {
+        precipitationDialog.show();
+        precipitationDialog.raise();
+        precipitationDialog.activateWindow();
+    });
+
     QAction *plowAction = trayMenu.addAction(QObject::tr("Вызвать снегоуборщик"));
     QObject::connect(plowAction, &QAction::triggered, &window, &SnowWindow::startPlow);
-
+    QSystemTrayIcon tray;
+    const auto syncSeasonActions = [&] {
+        const bool winter = window.season() == Season::Winter;
+        garlandsAction->setVisible(winter);
+        plowAction->setVisible(winter);
+        autumnMenu->menuAction()->setVisible(window.season() == Season::Autumn);
+        springMenu->menuAction()->setVisible(window.season() == Season::Spring);
+        const bool summer = window.season() == Season::Summer;
+        settingsMenu->menuAction()->setVisible(!summer);
+        summerMenu->menuAction()->setVisible(summer);
+        if (!summer) {
+            fan->setChecked(false);
+            jar->setChecked(false);
+        }
+        if (summer)
+            precipitationDialog.hide();
+        for (const auto &entry : seasons) {
+            if (entry.season == window.season()) {
+                tray.setIcon(QIcon(QStringLiteral(":/assets/%1.svg").arg(QString::fromLatin1(entry.key))));
+                break;
+            }
+        }
+    };
+    syncSeasonActions();
+    QObject::connect(&seasonGroup, &QActionGroup::triggered, &trayMenu, [&](QAction *action) {
+        const QString key = action->data().toString();
+        for (const auto &entry : seasons) {
+            if (key == QLatin1String(entry.key)) {
+                window.setSeason(entry.season);
+                settings.setValue(QStringLiteral("season"), key);
+                syncSeasonActions();
+                break;
+            }
+        }
+    });
     trayMenu.addSeparator();
     QAction *quitAction = trayMenu.addAction(QObject::tr("Выход"));
     QObject::connect(quitAction, &QAction::triggered, &app, &QApplication::quit);
 
-    // Показывает только пункты текущего сезона. Последнюю включённую осадку снять нельзя:
-    // осень без дождя и листьев была бы просто пустым экраном.
-    const auto syncMenu = [&] {
-        const bool autumn = window.season() == Season::Autumn;
-        winterAction->setChecked(!autumn);
-        autumnAction->setChecked(autumn);
-        rainAction->setVisible(autumn);
-        leavesAction->setVisible(autumn);
-        plowAction->setVisible(!autumn);
-        rainAction->setEnabled(!rainAction->isChecked() || leavesAction->isChecked());
-        leavesAction->setEnabled(!leavesAction->isChecked() || rainAction->isChecked());
-    };
-    QObject::connect(&seasonGroup, &QActionGroup::triggered, &window, [&](QAction *action) {
-        window.setSeason(action == autumnAction ? Season::Autumn : Season::Winter);
-        syncMenu();
-    });
-    const auto applyAutumnOptions = [&] {
-        window.setAutumnOptions({rainAction->isChecked(), leavesAction->isChecked()});
-        syncMenu();
-    };
-    QObject::connect(rainAction, &QAction::toggled, &window, applyAutumnOptions);
-    QObject::connect(leavesAction, &QAction::toggled, &window, applyAutumnOptions);
-    syncMenu();
-
-    QSystemTrayIcon tray(makeTrayIcon());
     tray.setToolTip(QStringLiteral("SnowOverlay"));
     tray.setContextMenu(&trayMenu);
     tray.show();
+    for (QAction *boat : {springBoat, autumnBoat}) {
+        QObject::connect(boat, &QAction::triggered, &tray, [&] {
+            if (!window.launchPaperBoat())
+                tray.showMessage(QObject::tr("Бумажный кораблик"),
+                                 QObject::tr("Подожди, пока дождь наполнит лужи."));
+        });
+    }
 
     return app.exec();
 }

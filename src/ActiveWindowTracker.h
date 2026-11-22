@@ -33,6 +33,7 @@ public:
     // Сообщить бэкенду, где находится оверлей (глобальные логические координаты).
     // Нужно тем бэкендам, которым приходится самим «прижимать» окно оверлея.
     virtual void setOverlayGeometry(const QRect &globalRect) { Q_UNUSED(globalRect); }
+    virtual void setSeasonalCursorTracking(bool enabled) { Q_UNUSED(enabled); }
 
     // Фабрика: перебирает бэкенды и возвращает первый, который запустился.
     // nullptr — активное окно определить нечем (тогда снег рисуется на весь экран).
@@ -42,7 +43,7 @@ Q_SIGNALS:
     // Геометрия активного окна ВМЕСТЕ с рамкой и заголовком, в глобальных
     // логических координатах экрана. Пустой QRect — активного окна нет
     // (рабочий стол, панель, окно оверлея и т.п.).
-    void activeRectChanged(const QRect &globalRect);
+    void activeRectChanged(const QRect &globalRect, bool fullscreen);
     // Видимые окна и панели текущего рабочего стола, снизу вверх.
     void surfacesChanged(const QList<SnowSurface> &surfaces);
     void cursorPosChanged(const QPoint &globalPosition);

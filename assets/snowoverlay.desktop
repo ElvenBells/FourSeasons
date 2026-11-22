@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Four Seasons
+Name[ru]=Четыре сезона
+Comment=Seasonal effects for the desktop
+Comment[ru]=Сезонные эффекты для рабочего стола
+Exec=SnowOverlay
+Icon=snowoverlay
+Terminal=false
+Categories=Utility;
+StartupWMClass=snowoverlay

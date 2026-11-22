@@ -1,8 +1,8 @@
-# SnowOverlay — снежный оверлей для рабочего стола (Qt 6)
+# SnowOverlay — сезонный оверлей для рабочего стола (Qt 6)
 #
 # Зависимости Debian 12:
 #   sudo apt install build-essential cmake pkg-config qt6-base-dev qt6-wayland \
-#                    libgl1-mesa-dev libx11-dev libxext-dev
+#                    libgl1-mesa-dev libx11-dev libxext-dev qt6-svg-plugins
 #
 cmake_minimum_required(VERSION 3.16)
 project(SnowOverlay VERSION 0.1.0 LANGUAGES CXX)
@@ -21,8 +21,14 @@ find_package(Qt6 6.4 REQUIRED COMPONENTS Widgets Network)
 set(SNOW_SOURCES
     src/main.cpp
     src/Constants.h
+    src/Precipitation.h
     src/SnowWindow.h
     src/SnowWindow.cpp
+    src/Season.h
+    src/SeasonalWeather.h
+    src/SeasonalWeather.cpp
+    src/SeasonalScenery.h
+    src/SeasonalScenery.cpp
     src/SnowScene.h
     src/SnowScene.cpp
     src/SnowProps.h
@@ -30,9 +36,6 @@ set(SNOW_SOURCES
     src/SnowSurface.h
     src/SnowCrystal.h
     src/SnowCrystal.cpp
-    src/Season.h
-    src/AutumnWeather.h
-    src/AutumnWeather.cpp
     src/ActiveWindowTracker.h
     src/ActiveWindowTracker.cpp
 )
@@ -50,6 +53,14 @@ if(UNIX AND NOT APPLE)
     list(APPEND SNOW_LIBS Qt6::DBus)
     list(APPEND SNOW_DEFS SNOW_HAS_KWIN)
 
+    # Слой поверх всплывающего меню Plasma на Wayland.
+    find_package(LayerShellQt QUIET)
+    if(TARGET LayerShellQt::Interface)
+        list(APPEND SNOW_SOURCES src/PanelGarland.cpp)
+        list(APPEND SNOW_LIBS LayerShellQt::Interface)
+        list(APPEND SNOW_DEFS SNOW_HAS_LAYER_SHELL)
+    endif()
+
     # Xlib нужен для проверки композитора даже при отключённом трекере X11.
     find_package(X11)
     if(X11_FOUND)
@@ -59,7 +70,7 @@ if(UNIX AND NOT APPLE)
             list(APPEND SNOW_LIBS X11::Xext)
             list(APPEND SNOW_DEFS SNOW_HAS_XSHAPE)
         else()
-            message(WARNING "Xext не найден (libxext-dev) — управление мышью на X11 отключено")
+            message(WARNING "Xext не найден (libxext-dev) — игровое управление кнопками мыши на X11 отключено")
         endif()
     else()
         message(WARNING "Xlib не найден (libx11-dev) — запуск через xcb отключён")
@@ -74,6 +85,10 @@ if(UNIX AND NOT APPLE)
 endif()
 
 add_executable(SnowOverlay ${SNOW_SOURCES})
+qt_add_resources(SnowOverlay "season_icons"
+    PREFIX "/"
+    FILES assets/snowoverlay.svg assets/winter.svg assets/spring.svg assets/summer.svg assets/autumn.svg
+)
 target_link_libraries(SnowOverlay PRIVATE ${SNOW_LIBS})
 target_compile_definitions(SnowOverlay PRIVATE ${SNOW_DEFS})
 
@@ -82,6 +97,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 install(TARGETS SnowOverlay RUNTIME DESTINATION bin)
+install(FILES assets/snowoverlay.desktop DESTINATION share/applications)
+install(FILES assets/snowoverlay.svg DESTINATION share/icons/hicolor/scalable/apps)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -91,5 +108,12 @@ if(BUILD_TESTING)
         target_include_directories(SnowSceneTest PRIVATE src)
         target_link_libraries(SnowSceneTest PRIVATE Qt6::Gui Qt6::Test)
         add_test(NAME SnowSceneTest COMMAND SnowSceneTest)
+
+        add_executable(SnowWindowTest tests/SnowWindowTest.cpp src/SnowWindow.cpp src/SnowScene.cpp
+                       src/SnowCrystal.cpp src/SnowProps.cpp src/SeasonalWeather.cpp src/SeasonalScenery.cpp)
+        target_include_directories(SnowWindowTest PRIVATE src)
+        target_link_libraries(SnowWindowTest PRIVATE Qt6::Widgets Qt6::Test)
+        add_test(NAME SnowWindowTest COMMAND SnowWindowTest)
+        set_tests_properties(SnowWindowTest PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
     endif()
 endif()

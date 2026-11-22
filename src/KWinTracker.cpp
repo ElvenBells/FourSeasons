@@ -4,6 +4,7 @@
 #include <QDBusConnection>
 #include <QDBusConnectionInterface>
 #include <QDBusMessage>
+#include <QDBusVariant>
 #include <QDebug>
 #include <QDir>
 #include <QEventLoop>
@@ -17,6 +18,7 @@ namespace {
 
 // --- адреса KWin ---------------------------------------------------------
 const QString kKWinService    = QStringLiteral("org.kde.KWin");
+const QString kKWinPath       = QStringLiteral("/KWin");
 const QString kScriptingPath  = QStringLiteral("/Scripting");
 const QString kScriptingIface = QStringLiteral("org.kde.kwin.Scripting");
 const QString kScriptIface    = QStringLiteral("org.kde.kwin.Script");
@@ -68,6 +70,8 @@ const char kScriptTemplate[] = R"JS(
     cursorTimer.singleShot = true;
     var cursorAreas = [];
     var cursorNearSnow = false;
+    var cursorEverywhere = false;
+    var lastCursorProbe = 0;
 
     // ---- совместимость: Plasma 5.27 (client*) и Plasma 6 (window*) ----
     function getActive()  { return (W.activeWindow !== undefined) ? W.activeWindow : W.activeClient; }
@@ -81,15 +85,17 @@ const char kScriptTemplate[] = R"JS(
         try { return (v === undefined || v === null) ? "" : String(v); } catch (e) { return ""; }
     }
 
-    // Окно оверлея опознаём по app_id/WM_CLASS ИЛИ по уникальному заголовку.
+    // Qt на X11 дописывает к заголовку отображаемое имя приложения.
+    // Проверка класса отделяет оверлей от чужих окон с похожим заголовком.
     function isOverlay(w) {
         if (!w) return false;
-        return str(w.resourceClass).toLowerCase() === APP_ID || str(w.caption).indexOf(TITLE) === 0;
+        return str(w.resourceClass).toLowerCase() === APP_ID && str(w.caption).indexOf(TITLE) === 0;
     }
 
     // Окна, вокруг которых «дырку» в снегу делать не нужно.
     function isIgnored(w) {
-        return !w || isOverlay(w) || w.desktopWindow || w.dock || w.specialWindow || w.minimized;
+        return !w || isOverlay(w) || w.onScreenDisplay || w.desktopWindow || w.dock || w.specialWindow || w.appletPopup ||
+            w.minimized || w.hidden || w.readyForPainting === false || w.hiddenByShowDesktop;
     }
 
     function onCurrentDesktop(c) {
@@ -110,6 +116,8 @@ const char kScriptTemplate[] = R"JS(
 
     function send(w) {
         var parts = [isIgnored(w) ? "0" : geometry(w)];
+        if (parts[0] !== "0" && w.fullScreen)
+            parts[0] = "F:" + parts[0];
         var areas = [];
         var order = W.stackingOrder;
         if (!order || !order.length) {
@@ -120,16 +128,22 @@ const char kScriptTemplate[] = R"JS(
         for (var i = 0; i < order.length; ++i) {
             var client = order[i];
             var index = watched.indexOf(client);
-            if (index < 0 || isOverlay(client) || client.minimized || client.hidden || client.deleted)
+            var shell = str(client.resourceClass).toLowerCase();
+            var plasma = shell === "plasmashell" || shell === "org.kde.plasmashell";
+            var popup = plasma && (client.appletPopup || (typeof client.appletPopup === "undefined" &&
+                (client.popupMenu || client.dialog) && !client.tooltip));
+            if (index < 0 || (client.managed === false && !popup) || isOverlay(client) || client.onScreenDisplay || client.minimized || client.hidden ||
+                client.hiddenByShowDesktop || client.readyForPainting === false || client.deleted)
                 continue;
-            if (!client.dock && (client.desktopWindow || client.specialWindow || !onCurrentDesktop(client)))
+            if (!client.dock && (client.desktopWindow || (client.specialWindow && !popup) || !onCurrentDesktop(client)))
                 continue;
             var rect = geometry(client);
             if (rect !== "0") {
-                parts.push((client.dock ? "D" : "W") + windowIds[index] + ":" + rect);
-                if (TRACK_CURSOR && !client.dock) {
+                var type = popup ? "P" : client.dock ? "D" : client.fullScreen ? "F" : client.maximizeMode === 3 ? "M" : "W";
+                parts.push(type + windowIds[index] + ":" + rect);
+                if (TRACK_CURSOR && !client.dock && !client.fullScreen) {
                     var frame = client.frameGeometry || client.geometry;
-                    if (frame.y >= OVERLAY.y + 3 && frame.y < OVERLAY.y + OVERLAY.height)
+                    if (frame.y >= OVERLAY.y && frame.y < OVERLAY.y + OVERLAY.height)
                         areas.push(frame);
                 }
             }
@@ -149,21 +163,31 @@ const char kScriptTemplate[] = R"JS(
     function reportCursor() {
         var p = W.cursorPos;
         if (!p) return;
-        var near = false;
-        for (var i = 0; i < cursorAreas.length; ++i) {
+        // Учитываем ёлку и запас по высоте нижней панели.
+        var right = OVERLAY.x + OVERLAY.width;
+        var bottom = OVERLAY.y + OVERLAY.height;
+        var treeAreaHeight = 132 + Math.ceil(OVERLAY.height * .28);
+        var near = p.x >= right - 144 && p.x < right && p.y >= bottom - treeAreaHeight && p.y < bottom;
+        for (var i = 0; !near && i < cursorAreas.length; ++i) {
             var r = cursorAreas[i];
-            if (p.x >= r.x && p.x < r.x + r.width && p.y >= r.y - 32 && p.y <= r.y + 2) {
+            if (p.x >= r.x && p.x < r.x + r.width && p.y >= r.y - 32 &&
+                p.y <= Math.max(r.y + 2, OVERLAY.y + 8)) {
                 near = true;
                 break;
             }
         }
-        if (near || cursorNearSnow)
-            callDBus(SERVICE, PATH, IFACE, "cursorMessage", TOKEN, Math.round(p.x) + "," + Math.round(p.y));
+        var now = Date.now();
+        if (near || cursorNearSnow || cursorEverywhere || now - lastCursorProbe >= 350) {
+            lastCursorProbe = now;
+            callDBus(SERVICE, PATH, IFACE, "cursorMessage", TOKEN, Math.round(p.x) + "," + Math.round(p.y),
+                function (enabled) { cursorEverywhere = enabled === true; });
+        }
         cursorNearSnow = near;
     }
 
     // Прижимаем окно оверлея: поверх всех, без панели задач, на весь экран.
     function setupOverlay(w) {
+        if (w.managed === false) return; // X11-оверлей уже выставлен самим клиентом.
         try {
             w.keepAbove = true;
             w.skipTaskbar = true;
@@ -179,19 +203,30 @@ const char kScriptTemplate[] = R"JS(
     }
 
     function watch(w) {
-        if (!w || watched.indexOf(w) >= 0) return;
+        if (!w || w.onScreenDisplay || watched.indexOf(w) >= 0) return;
         watched.push(w);
         var id = str(w.internalId);
         windowIds.push(/^\{?[0-9a-fA-F-]{36}\}?$/.test(id) ? id : TOKEN + "-" + nextId++);
         if (isOverlay(w)) return;
+        if (str(w.resourceClass).toLowerCase() === APP_ID && w.captionChanged) {
+            w.captionChanged.connect(function () {
+                if (isOverlay(w)) setupOverlay(w);
+            });
+        }
         function changed() {
             var active = getActive();
             if (w === active) send(active);
             else scheduleGeometry();
         }
         if (w.frameGeometryChanged) w.frameGeometryChanged.connect(changed);
-        if (w.minimizedChanged) w.minimizedChanged.connect(changed);
+        if (w.minimizedChanged) w.minimizedChanged.connect(scheduleGeometry);
+        if (w.fullScreenChanged) w.fullScreenChanged.connect(scheduleGeometry);
+        if (w.maximizedChanged) w.maximizedChanged.connect(scheduleGeometry);
         if (w.hiddenChanged) w.hiddenChanged.connect(scheduleGeometry);
+        if (w.windowShown) w.windowShown.connect(scheduleGeometry);
+        if (w.windowHidden) w.windowHidden.connect(scheduleGeometry);
+        if (w.readyForPaintingChanged) w.readyForPaintingChanged.connect(scheduleGeometry);
+        if (w.hiddenByShowDesktopChanged) w.hiddenByShowDesktopChanged.connect(scheduleGeometry);
         if (w.desktopsChanged) w.desktopsChanged.connect(scheduleGeometry);
         if (w.stackingOrderChanged) w.stackingOrderChanged.connect(scheduleGeometry);
     }
@@ -249,6 +284,7 @@ const char kScriptTemplate[] = R"JS(
     sigRemoved.connect(onRemoved);
     sigActivated.connect(onActivated);
     W.currentDesktopChanged.connect(function () { send(getActive()); });
+    if (W.stackingOrderChanged) W.stackingOrderChanged.connect(scheduleGeometry);
     focusTimer.timeout.connect(settleFocus);
     geometryTimer.timeout.connect(function () {
         var active = getActive();
@@ -299,6 +335,7 @@ void KWinTracker::reloadScript()
     unloadScript();
     if (!loadScript()) {
         m_activeRect = {};
+        m_activeFullscreen = false;
         m_surfaces.clear();
     }
     publishGeometry();
@@ -306,8 +343,29 @@ void KWinTracker::reloadScript()
 
 void KWinTracker::publishGeometry()
 {
-    emit activeRectChanged(m_activeRect);
-    emit surfacesChanged(m_surfaces);
+    emit activeRectChanged(m_showingDesktop ? QRect() : m_activeRect, !m_showingDesktop && m_activeFullscreen);
+    emit surfacesChanged(visibleSurfaces());
+}
+
+QList<SnowSurface> KWinTracker::visibleSurfaces() const
+{
+    if (!m_showingDesktop)
+        return m_surfaces;
+    QList<SnowSurface> docks;
+    for (const SnowSurface &surface : m_surfaces) {
+        if (surface.dock || surface.panelPopup)
+            docks.append(surface);
+    }
+    return docks;
+}
+
+void KWinTracker::showingDesktopChanged(bool showing)
+{
+    if (m_showingDesktop == showing)
+        return;
+    m_showingDesktop = showing;
+    if (m_scriptLoaded)
+        publishGeometry();
 }
 
 bool KWinTracker::start()
@@ -332,6 +390,12 @@ bool KWinTracker::start()
         return false;
     }
     m_dbusRegistered = true;
+    bus.connect(kKWinService, kKWinPath, kKWinService, QStringLiteral("showingDesktopChanged"),
+                this, SLOT(showingDesktopChanged(bool)));
+    const auto desktopMode = callKWin(kKWinPath, QStringLiteral("org.freedesktop.DBus.Properties"),
+                                      QStringLiteral("Get"), {kKWinService, QStringLiteral("showingDesktop")});
+    if (desktopMode.type() == QDBusMessage::ReplyMessage && !desktopMode.arguments().isEmpty())
+        m_showingDesktop = desktopMode.arguments().constFirst().value<QDBusVariant>().variant().toBool();
 
     // Удаляем скрипт, который мог остаться в KWin после аварийного выхода.
     unloadScript();
@@ -450,6 +514,8 @@ void KWinTracker::stop()
         unloadScript();
     if (m_dbusRegistered) {
         QDBusConnection bus = QDBusConnection::sessionBus();
+        bus.disconnect(kKWinService, kKWinPath, kKWinService, QStringLiteral("showingDesktopChanged"),
+                       this, SLOT(showingDesktopChanged(bool)));
         bus.unregisterObject(kPath);
         bus.unregisterService(kService);
         m_dbusRegistered = false;
@@ -476,43 +542,52 @@ void KWinTracker::geometryMessage(const QString &scriptToken, const QString &mes
     if (m_scriptToken.isEmpty() || scriptToken != m_scriptToken)
         return;
     const QStringList parts = message.split(QLatin1Char(';'));
-    const QRect activeRect = parseRect(parts.first());
-    if (activeRect.isEmpty() && parts.first() != QLatin1String("0"))
+    const QString &active = parts.first();
+    const bool fullscreen = active.startsWith(QLatin1String("F:"));
+    const QRect activeRect = parseRect(fullscreen ? active.mid(2) : active);
+    if (activeRect.isEmpty() && active != QLatin1String("0"))
         return;
     QList<SnowSurface> surfaces;
     for (qsizetype i = 1; i < parts.size(); ++i) {
         const QString &entry = parts.at(i);
         const qsizetype separator = entry.indexOf(QLatin1Char(':'));
-        if (separator <= 1 || (entry.front() != QLatin1Char('D') && entry.front() != QLatin1Char('W')))
+        if (separator <= 1)
+            continue;
+        const QChar type = entry.front();
+        if (type != QLatin1Char('D') && type != QLatin1Char('F') && type != QLatin1Char('W') && type != QLatin1Char('P') &&
+            type != QLatin1Char('M'))
             continue;
         const QRect rect = parseRect(entry.mid(separator + 1));
         if (!rect.isEmpty())
-            surfaces.append({entry.mid(1, separator - 1), rect, entry.front() == QLatin1Char('D')});
+            surfaces.append({entry.mid(1, separator - 1), rect, type == QLatin1Char('D'),
+                             type == QLatin1Char('F'), type == QLatin1Char('M'), type == QLatin1Char('P')});
     }
-    const bool activeChanged = m_activeRect != activeRect;
+    const bool activeChanged = m_activeRect != activeRect || m_activeFullscreen != fullscreen;
     const bool surfacesUpdated = m_surfaces != surfaces;
     m_activeRect = activeRect;
+    m_activeFullscreen = fullscreen;
     m_surfaces = surfaces;
     if (!m_receivedInitialGeometry) {
         m_receivedInitialGeometry = true;
         emit initialGeometryReceived();
     }
-    if (m_scriptLoaded && activeChanged)
-        emit activeRectChanged(m_activeRect);
+    if (m_scriptLoaded && activeChanged && !m_showingDesktop)
+        emit activeRectChanged(m_activeRect, m_activeFullscreen);
     if (m_scriptLoaded && surfacesUpdated)
-        emit surfacesChanged(m_surfaces);
+        emit surfacesChanged(visibleSurfaces());
 }
 
-void KWinTracker::cursorMessage(const QString &scriptToken, const QString &message)
+bool KWinTracker::cursorMessage(const QString &scriptToken, const QString &message)
 {
     if (!m_scriptLoaded || scriptToken != m_scriptToken)
-        return;
+        return false;
     const qsizetype comma = message.indexOf(QLatin1Char(','));
     if (comma < 0)
-        return;
+        return false;
     bool xOk = false, yOk = false;
     const int x = QStringView(message).left(comma).toInt(&xOk);
     const int y = QStringView(message).mid(comma + 1).toInt(&yOk);
     if (xOk && yOk)
         emit cursorPosChanged(QPoint(x, y));
+    return m_seasonalCursorTracking;
 }

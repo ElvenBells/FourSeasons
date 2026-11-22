@@ -1,7 +1,10 @@
 #include "SnowWindow.h"
 #include "Constants.h"
+#include "SnowProps.h"
 
 #include <QColor>
+#include <QDataStream>
+#include <QIODevice>
 #include <QGuiApplication>
 #include <QMouseEvent>
 #include <QPaintEvent>
@@ -12,25 +15,33 @@
 #include <QShowEvent>
 #include <QWindow>
 
+#include <algorithm>
 #include <cmath>
 
-#ifdef SNOW_HAS_XSHAPE
+#ifdef SNOW_HAS_XLIB
 #include <X11/Xlib.h>
+#endif
+#ifdef SNOW_HAS_XSHAPE
 #include <X11/extensions/shape.h>
 #endif
 
 namespace {
 
-constexpr int    kFlakeCount = 180;     // 150–200 по ТЗ
 constexpr int    kFrameMs    = 16;      // ~60 FPS
+constexpr int    kResumeMs   = 180;
 constexpr double kTwoPi      = 6.283185307179586;
+
+QRect popupGarland(const QRect &frame)
+{
+    return frame.isEmpty() ? QRect() : QRect(frame.topLeft(), QSize(frame.width(), 24));
+}
 
 bool isWaylandPlatform()
 {
     return QGuiApplication::platformName().startsWith(QLatin1String("wayland"));
 }
 
-#if defined(SNOW_HAS_XSHAPE) && QT_CONFIG(xcb)
+#if defined(SNOW_HAS_XLIB) && QT_CONFIG(xcb)
 Display *x11Display()
 {
     auto *x11 = qGuiApp->nativeInterface<QNativeInterface::QX11Application>();
@@ -42,6 +53,55 @@ Display *x11Display()
 double rnd(double a, double b)
 {
     return a + (b - a) * QRandomGenerator::global()->generateDouble();
+}
+
+QRegion holeOutline(const QRegion &hole)
+{
+    const QRect bounds = hole.boundingRect();
+    return QRegion(bounds) - bounds.adjusted(3, 3, -3, -3);
+}
+
+QRegion groupX11Damage(const QRegion &damage, const QRect &viewport)
+{
+    constexpr int bandHeight = 24;
+    constexpr int maxGap = 128;
+    const qint64 extraBudget = qMin<qint64>(200000, qint64(viewport.width()) * viewport.height() / 16);
+    qint64 area = 0;
+    std::vector<QRect> slices;
+    slices.reserve(damage.rectCount());
+    // Одинаковая высота внутри полосы не даёт QRegion снова дробить прямоугольники.
+    for (const QRect &part : damage) {
+        area += qint64(part.width()) * part.height();
+        for (int y = part.top() / bandHeight * bandHeight; y <= part.bottom(); y += bandHeight) {
+            const int height = qMin(bandHeight, viewport.height() - y);
+            slices.emplace_back(part.x(), y, part.width(), height);
+        }
+    }
+    std::sort(slices.begin(), slices.end(), [](const QRect &a, const QRect &b) {
+        return a.y() == b.y() ? a.x() < b.x() : a.y() < b.y();
+    });
+
+    QRegion grouped;
+    qint64 groupedArea = 0;
+    QRect run;
+    const auto append = [&](const QRect &part) {
+        grouped += part;
+        groupedArea += qint64(part.width()) * part.height();
+    };
+    for (const QRect &slice : slices) {
+        if (run.isValid() && run.y() == slice.y() && slice.left() - run.right() - 1 <= maxGap) {
+            run.setRight(qMax(run.right(), slice.right()));
+        } else {
+            if (run.isValid())
+                append(run);
+            run = slice;
+        }
+    }
+    if (run.isValid())
+        append(run);
+    if (groupedArea > area + extraBudget || grouped.rectCount() >= damage.rectCount())
+        return damage;
+    return grouped;
 }
 
 } // namespace
@@ -65,10 +125,19 @@ SnowWindow::SnowWindow(QWidget *parent)
     setMouseTracking(m_interactive);
 
     m_layoutTimer.setSingleShot(true);
-    connect(&m_layoutTimer, &QTimer::timeout, this, [this] {
-        applyHole();
-        updateSceneLayout();
+    connect(&m_layoutTimer, &QTimer::timeout, this, &SnowWindow::refreshLayout);
+    m_resumeTimer.setSingleShot(true);
+    m_resumeTimer.setTimerType(Qt::PreciseTimer);
+    m_resumeTimer.setInterval(kResumeMs);
+    connect(&m_resumeTimer, &QTimer::timeout, this, &SnowWindow::resumeWeather);
+    m_popupTimer.setSingleShot(true);
+    m_popupTimer.setInterval(90);
+    connect(&m_popupTimer, &QTimer::timeout, this, [this] {
+        refreshGarlandOverlay(popupGarland(m_popupFrame));
     });
+#ifdef SNOW_HAS_LAYER_SHELL
+    connect(&m_garlandLayer, &QProcess::started, this, &SnowWindow::sendLayerGarlands);
+#endif
     adoptScreen(QGuiApplication::primaryScreen());
     connect(qGuiApp, &QGuiApplication::primaryScreenChanged, this, &SnowWindow::adoptScreen);
 
@@ -83,6 +152,16 @@ SnowWindow::SnowWindow(QWidget *parent)
     m_timer.start();
 }
 
+SnowWindow::~SnowWindow()
+{
+#ifdef SNOW_HAS_LAYER_SHELL
+    if (m_garlandLayer.state() != QProcess::NotRunning) {
+        m_garlandLayer.closeWriteChannel();
+        m_garlandLayer.waitForFinished(300);
+    }
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // Флаги окна — самое платформо-зависимое место программы.
 // ---------------------------------------------------------------------------
@@ -94,13 +173,14 @@ void SnowWindow::configureWindowFlags()
                           | Qt::NoDropShadowWindowHint;
 
     const QString platform = QGuiApplication::platformName();
+    m_x11 = platform == QLatin1String("xcb");
 
     if (platform.startsWith(QLatin1String("wayland"))) {
         // Wayland: клиент не управляет ни положением, ни слоем окна, а WindowStaysOnTopHint
         // игнорируется. Всё это (keepAbove, «без панели задач», геометрию «на весь экран»)
-        // делает KWin-скрипт из KWinTracker — он находит наше окно по app_id и заголовку.
+        // делает KWin-скрипт из KWinTracker — он находит оверлей по заголовку.
         m_interactive = true;
-    } else if (platform == QLatin1String("xcb")) {
+    } else if (m_x11) {
         // X11 / XWayland: BypassWindowManagerHint = override-redirect. Окно полностью вне
         // власти WM: нет рамки, нет записи в панели задач, не получает фокус, остаётся
         // сверху, а позицию мы задаём сами. В KWin такие окна рисуются поверх остальных.
@@ -132,7 +212,7 @@ void SnowWindow::adoptScreen(QScreen *screen)
     m_screen = screen;
     if (m_screen) {
         connect(m_screen, &QScreen::geometryChanged, this, [this](const QRect &) { updateScreenGeometry(); });
-        connect(m_screen, &QScreen::availableGeometryChanged, this, &SnowWindow::updateSceneLayout);
+        connect(m_screen, &QScreen::availableGeometryChanged, this, &SnowWindow::refreshLayout);
         if (QWindow *wh = windowHandle())
             wh->setScreen(m_screen);
     }
@@ -144,21 +224,24 @@ void SnowWindow::updateScreenGeometry()
     m_inputRegionSet = false;
     m_screenRect = m_screen ? m_screen->geometry() : QRect(0, 0, 1280, 720);
     setGeometry(m_screenRect);   // под Wayland позицию игнорирует Qt, её выставит KWin-скрипт
-    applyHole();
-    updateSceneLayout();
+    refreshLayout();
     emit overlayGeometryChanged(m_screenRect);
 }
 
-void SnowWindow::setActiveRect(const QRect &globalRect)
+void SnowWindow::setActiveRect(const QRect &globalRect, bool fullscreen)
 {
-    if (m_activeGlobal == globalRect)
+    if (m_activeGlobal == globalRect && m_activeFullscreen == fullscreen)
         return;
     m_activeGlobal = globalRect;
+    m_activeFullscreen = fullscreen;
+    if (m_resumeTimer.isActive())
+        m_resumeTimer.start();
     m_layoutTimer.start(0);
 }
 
 void SnowWindow::setSurfaces(const QList<SnowSurface> &surfaces)
 {
+    m_receivedSurfaces = true;
     m_surfaces = surfaces;
     m_layoutTimer.start(0);
 }
@@ -166,7 +249,14 @@ void SnowWindow::setSurfaces(const QList<SnowSurface> &surfaces)
 void SnowWindow::setGlobalCursorPos(const QPoint &globalPosition)
 {
     const QPoint local = globalPosition - m_screenRect.topLeft();
-    if (m_season == Season::Winter && m_interactive && rect().contains(local) && !m_inputRegion.contains(local))
+    if (m_season != Season::Winter) {
+        if (!m_suspended && rect().contains(local))
+            m_weather.movePointer(local, false);
+        else
+            m_weather.leavePointer();
+        return;
+    }
+    if (!m_suspended && rect().contains(local) && !m_inputRegion.contains(local))
         m_scene.hoverWindows(local);
     else
         m_scene.leaveWindows();
@@ -174,9 +264,9 @@ void SnowWindow::setGlobalCursorPos(const QPoint &globalPosition)
 
 void SnowWindow::pollWindowHover()
 {
-#if defined(SNOW_HAS_XSHAPE) && QT_CONFIG(xcb)
+#if defined(SNOW_HAS_XLIB) && QT_CONFIG(xcb)
     QWindow *window = windowHandle();
-    if (m_surfaces.isEmpty() || !window || m_scene.dragging() || m_scene.aiming())
+    if (!window || m_scene.dragging() || m_scene.aiming())
         return;
     if (Display *display = x11Display()) {
         Window root = 0, child = 0;
@@ -189,23 +279,256 @@ void SnowWindow::pollWindowHover()
             setGlobalCursorPos(local + m_screenRect.topLeft());
         } else {
             m_scene.leaveWindows();
+            m_weather.leavePointer();
         }
     }
 #endif
 }
 
-void SnowWindow::updateSceneLayout()
+QRect SnowWindow::winterWorkArea() const
+{
+    QRect area = m_screen ? m_screen->availableGeometry().intersected(m_screenRect) : m_screenRect;
+    if (area.isEmpty())
+        area = m_screenRect;
+    // Некоторые X11-конфигурации возвращают весь монитор даже при видимой панели.
+    for (const SnowSurface &surface : m_surfaces) {
+        if (!surface.dock)
+            continue;
+        const QRect panel = surface.rect & m_screenRect;
+        if (panel.isEmpty())
+            continue;
+        if (panel.width() >= m_screenRect.width() * .8 && panel.height() < m_screenRect.height() / 4) {
+            if (panel.bottom() == m_screenRect.bottom())
+                area.setBottom(qMin(area.bottom(), panel.top() - 1));
+            if (panel.top() == m_screenRect.top())
+                area.setTop(qMax(area.top(), panel.bottom() + 1));
+        } else if (panel.height() >= m_screenRect.height() * .8 && panel.width() < m_screenRect.width() / 4) {
+            if (panel.right() == m_screenRect.right())
+                area.setRight(qMin(area.right(), panel.left() - 1));
+            if (panel.left() == m_screenRect.left())
+                area.setLeft(qMax(area.left(), panel.right() + 1));
+        }
+    }
+    return area;
+}
+
+const SnowSurface *SnowWindow::fullscreenSurface() const
+{
+    const QRect work = m_season == Season::Winter ? winterWorkArea().adjusted(1, 1, -1, -1) : QRect();
+    for (auto it = m_surfaces.crbegin(); it != m_surfaces.crend(); ++it) {
+        if (it->dock || it->panelPopup)
+            continue;
+        if ((it->fullscreen && it->rect.contains(m_screenRect)) ||
+            (work.isValid() && it->rect.contains(work)) ||
+            (m_season == Season::Winter && it->maximized && it->rect.contains(m_screenRect.center())))
+            return &*it;
+    }
+    return nullptr;
+}
+
+bool SnowWindow::coveredByFullscreen() const
+{
+    const SnowSurface *fullscreen = fullscreenSurface();
+    if (!fullscreen) {
+        const QRect work = m_season == Season::Winter ? winterWorkArea().adjusted(1, 1, -1, -1) : QRect();
+        return (m_activeFullscreen && m_activeGlobal.contains(m_screenRect)) ||
+               (work.isValid() && m_activeGlobal.contains(work));
+    }
+
+    QRegion visible(m_screenRect & fullscreen->rect);
+    for (auto above = m_surfaces.crbegin(); &*above != fullscreen; ++above) {
+        visible -= above->rect;
+        if (visible.isEmpty())
+            return false;
+    }
+    return true;
+}
+
+void SnowWindow::refreshLayout()
 {
     if (size().isEmpty())
         return;
+    updatePanelPopup();
+    const bool fullscreen = coveredByFullscreen();
+    if (m_suspended) {
+        if (fullscreen)
+            m_resumeTimer.stop();
+        else if (!m_resumeTimer.isActive())
+            m_resumeTimer.start();
+        if (m_season == Season::Winter)
+            updateSceneLayout();
+        updatePausedGarlands();
+        return;
+    }
+    if (!fullscreen) {
+        updateDamage(updateHole());
+        updateSceneLayout();
+        return;
+    }
+
+    m_suspended = true;
+    emit seasonalCursorTrackingChanged(false);
+    m_weather.setTool(SeasonTool::Passive);
+    m_timer.stop();
+    m_scene.cancelDrag();
+    m_scene.cancelAim();
+    m_scene.leave();
+    m_scene.leaveWindows();
+    unsetCursor();
+    if (m_season == Season::Winter)
+        updateSceneLayout();
+    updatePausedGarlands();
+    updateHole();
+    update();
+    applyInputRegion();
+}
+
+void SnowWindow::updatePausedGarlands()
+{
+    SnowScene::Garlands next;
+    if (m_suspended && m_season == Season::Winter) {
+        if (const SnowSurface *cover = fullscreenSurface())
+            next = m_scene.garlandsAbove(cover->id);
+        if (m_scene.garlandsPending() && !m_timer.isActive()) {
+            m_clock.restart();
+            m_timer.start();
+        } else if (!m_scene.garlandsPending()) {
+            m_timer.stop();
+        }
+    } else if (m_suspended) {
+        m_timer.stop();
+    }
+
+    QRegion damage;
+    if (next != m_pausedGarlands) {
+        for (const auto &garland : m_pausedGarlands)
+            damage += garland.second;
+        for (const auto &garland : next)
+            damage += garland.second;
+        m_pausedGarlands = std::move(next);
+        refreshGarlandOverlay(damage);
+    } else if (m_suspended && m_x11 && m_pausedGarlands.isEmpty() && m_popupFrame.isEmpty()) {
+        hide();
+    }
+}
+
+void SnowWindow::updatePanelPopup()
+{
+    QRect next;
+    if (m_season == Season::Winter && m_showGarlands) {
+        for (auto it = m_surfaces.crbegin(); it != m_surfaces.crend(); ++it) {
+            if (it->panelPopup && it->rect.width() >= 56 && it->rect.height() >= 36 &&
+                it->rect.top() >= m_screenRect.top() && it->rect.intersects(m_screenRect)) {
+                next = it->rect.translated(-m_screenRect.topLeft());
+                break;
+            }
+        }
+    }
+    if (next == m_popupFrame)
+        return;
+    const QRect previous = popupGarland(m_popupFrame);
+    m_popupFrame = next;
+    m_popupTimer.stop();
+    if (!next.isEmpty())
+        m_popupTimer.start();
+    refreshGarlandOverlay(previous);
+}
+
+void SnowWindow::refreshGarlandOverlay(const QRegion &damage)
+{
+    const bool decorations = !m_pausedGarlands.isEmpty() || (!m_popupFrame.isEmpty() && !m_popupTimer.isActive());
+#ifdef SNOW_HAS_LAYER_SHELL
+    if (useGarlandLayer()) {
+        if (m_garlandLayer.state() == QProcess::Running)
+            sendLayerGarlands();
+        else if (m_garlandLayer.state() == QProcess::NotRunning && decorations) {
+            auto environment = QProcessEnvironment::systemEnvironment();
+            environment.insert(QStringLiteral("QT_WAYLAND_SHELL_INTEGRATION"), QStringLiteral("layer-shell"));
+            m_garlandLayer.setProcessEnvironment(environment);
+            m_garlandLayer.setProcessChannelMode(QProcess::ForwardedChannels);
+            m_garlandLayer.start(QCoreApplication::applicationFilePath(), {QStringLiteral("--panel-garland")});
+        }
+        return;
+    }
+#endif
+    if (m_suspended && m_x11) {
+        if (!decorations) {
+            hide();
+            return;
+        }
+        if (!isVisible())
+            show();
+    }
+    if (m_x11 && !m_popupFrame.isEmpty() && !m_popupTimer.isActive())
+        raise();
+    updateDamage(damage);
+}
+
+bool SnowWindow::useGarlandLayer() const
+{
+#ifdef SNOW_HAS_LAYER_SHELL
+    return isWaylandPlatform();
+#else
+    return false;
+#endif
+}
+
+#ifdef SNOW_HAS_LAYER_SHELL
+void SnowWindow::sendLayerGarlands()
+{
+    auto garlands = m_pausedGarlands;
+    if (!m_popupFrame.isEmpty() && !m_popupTimer.isActive())
+        garlands.append({m_popupFrame, QRegion(popupGarland(m_popupFrame))});
+    QByteArray payload;
+    QDataStream stream(&payload, QIODevice::WriteOnly);
+    stream << QGuiApplication::screens().indexOf(m_screen) << garlands;
+    m_garlandLayer.write(payload.toBase64() + '\n');
+}
+#endif
+
+void SnowWindow::resumeWeather()
+{
+    if (!m_suspended || coveredByFullscreen() || size().isEmpty())
+        return;
+    m_suspended = false;
+    updatePausedGarlands();
+    emit seasonalCursorTrackingChanged(m_season != Season::Winter);
+    if (m_season == Season::Winter)
+        initFlakes();
+    else
+        m_weather.restart();
+    QRegion damage = updateHole();
+    updateSceneLayout();
+    m_scene.clearShedSnow();
+    if (m_x11) {
+        show(); // showEvent восстанавливает регион ввода перед первым кадром.
+    } else {
+        if (m_season == Season::Winter)
+            damage += m_scene.visualRegion();
+        if (m_debug)
+            damage += holeOutline(m_hole);
+        updateDamage(damage);
+        applyInputRegion();
+    }
+    m_clock.restart();
+    m_timer.start();
+}
+
+void SnowWindow::updateSceneLayout()
+{
     QRect dock;
+    const QRect winterArea = m_season == Season::Winter ? winterWorkArea().adjusted(1, 1, -1, -1) : QRect();
     QList<SnowSurface> localSurfaces;
+    QList<SnowSurface> weatherWindows;
     for (const SnowSurface &surface : m_surfaces) {
         const QRect frame = surface.rect.translated(-m_screenRect.topLeft());
         const QRect local = frame.intersected(rect());
         if (!surface.dock) {
-            if (!local.isEmpty())
-                localSurfaces.append({surface.id, frame});
+            if (m_season == Season::Winter && !local.isEmpty())
+                localSurfaces.append({surface.id, frame, false, surface.fullscreen ||
+                                      (winterArea.isValid() && surface.rect.contains(winterArea)), surface.maximized, surface.panelPopup});
+            else if (m_season != Season::Winter && !local.isEmpty())
+                weatherWindows.append({surface.id, frame, false, surface.fullscreen, surface.maximized, surface.panelPopup});
             continue;
         }
         if (!local.isEmpty() && local.y() >= height() * .72 &&
@@ -218,49 +541,63 @@ void SnowWindow::updateSceneLayout()
         if (y > height() * .8 && y <= height() - 4)
             dock = QRect(0, y, width(), height() - y);
     }
-    // Осенний слой не использует мышь, поэтому ему нужна раскладка и без интерактивного режима.
-    m_autumn.setSize(size());
-    m_autumn.setGround(dock);
-    if (!m_interactive)
-        return;
-    m_scene.setLayout(size(), dock, m_activeGlobal.translated(-m_screenRect.topLeft()), localSurfaces);
+    if (m_season == Season::Winter) {
+        m_scene.setLayout(size(), dock, m_receivedSurfaces ? QRect() : m_activeGlobal.translated(-m_screenRect.topLeft()),
+                          localSurfaces, m_activeFullscreen);
+    } else {
+        const QRect active = m_activeGlobal.translated(-m_screenRect.topLeft());
+        if (!m_receivedSurfaces && !m_activeFullscreen && active.intersects(rect()))
+            weatherWindows.append({QStringLiteral("active-fallback"), active});
+        m_weather.setGround(dock);
+        m_weather.setSize(size());
+        m_weather.setWindows(weatherWindows);
+        applyInputRegion();
+    }
 }
 
-void SnowWindow::applyHole()
+QRegion SnowWindow::updateHole()
 {
     QRegion newHole;
-    if (!m_activeGlobal.isEmpty()) {
+    if (m_suspended) {
+        newHole = rect();
+    } else if (!m_activeGlobal.isEmpty()) {
         // глобальные координаты -> координаты окна оверлея
         const QRect local = m_activeGlobal.translated(-m_screenRect.topLeft()).intersected(rect());
         if (!local.isEmpty())
             newHole = local;
     }
     if (newHole == m_hole)
-        return;
+        return {};
 
-    // При смене полноэкранного окна меняется вся маска, но только снежинки
+    // При смене полноэкранного окна меняется вся маска, но только частицы погоды
     // могут менять пиксели в фоне. Игровые объекты обновляют свои области сами.
     const QRegion changed = m_hole.xored(newHole);
-    QRegion snow;
-    if (m_season == Season::Autumn) {
-        snow = m_autumn.overlapping(changed);
-    } else {
+    QRegion weather;
+    if (m_season == Season::Winter) {
         for (const Flake &flake : m_flakes) {
             if (changed.intersects(flake.rect))
-                snow += flake.rect;
+                weather += flake.rect;
         }
+    } else {
+        weather = m_weather.overlapping(changed);
     }
-    QRegion dirty = snow & changed;
-    if (m_debug) {
-        const auto outline = [](const QRegion &hole) {
-            const QRect bounds = hole.boundingRect();
-            return QRegion(bounds) - bounds.adjusted(3, 3, -3, -3);
-        };
-        dirty += outline(m_hole) + outline(newHole);
-    }
+    QRegion dirty = weather & changed;
+    if (m_debug)
+        dirty += holeOutline(m_hole) + holeOutline(newHole);
     m_hole = newHole;
-    if (!dirty.isEmpty())
-        update(dirty);
+    return dirty;
+}
+
+void SnowWindow::updateDamage(const QRegion &damage)
+{
+    if (damage.isEmpty())
+        return;
+    if (m_x11 && damage.rectCount() > 32) {
+        const QRect viewport = rect();
+        update(groupX11Damage(damage & viewport, viewport));
+    } else {
+        update(damage);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -269,8 +606,7 @@ void SnowWindow::applyHole()
 void SnowWindow::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
-    applyHole();
-    updateSceneLayout();
+    refreshLayout();
 }
 
 void SnowWindow::showEvent(QShowEvent *event)
@@ -285,8 +621,16 @@ void SnowWindow::applyInputRegion()
     QWindow *window = windowHandle();
     if (!m_interactive || !window)
         return;
-    // Осенью интерактивных объектов нет: пустая область ввода = окно прозрачно для мыши.
-    const QRegion region = m_season == Season::Winter ? m_scene.inputRegion().intersected(rect()) : QRegion();
+    QRegion region;
+    if (!m_suspended) {
+        if (m_season == Season::Winter) {
+            region = m_scene.inputRegion() & rect();
+        } else {
+            region = m_weather.inputRegion();
+            if (m_weather.tool() != SeasonTool::Acorn)
+                region = (region - m_hole) + m_weather.pileInputRegion();
+        }
+    }
     if (m_inputRegionSet && region == m_inputRegion)
         return;
     m_inputRegion = region;
@@ -319,6 +663,30 @@ void SnowWindow::applyInputRegion()
 
 void SnowWindow::mousePressEvent(QMouseEvent *event)
 {
+    if (m_suspended)
+        return QWidget::mousePressEvent(event);
+    if (m_season != Season::Winter) {
+        if (event->button() == Qt::RightButton) {
+            if (m_weather.breakPile(event->position())) {
+                applyInputRegion();
+                event->accept();
+                return;
+            }
+            if (m_weather.tool() != SeasonTool::Passive) {
+                setSeasonTool(SeasonTool::Passive);
+                event->accept();
+                return;
+            }
+        }
+        if (event->button() == Qt::LeftButton && m_weather.press(event->position())) {
+            if (m_weather.tool() == SeasonTool::Passive)
+                unsetCursor();
+            applyInputRegion();
+            event->accept();
+            return;
+        }
+        return QWidget::mousePressEvent(event);
+    }
     if (event->button() == Qt::RightButton) {
         if (m_scene.aiming()) {
             m_scene.cancelAim();
@@ -327,7 +695,7 @@ void SnowWindow::mousePressEvent(QMouseEvent *event)
             event->accept();
             return;
         }
-        if (m_scene.breakSnowman(event->position())) {
+        if (m_scene.breakSnow(event->position())) {
             applyInputRegion();
             event->accept();
             return;
@@ -352,6 +720,12 @@ void SnowWindow::mousePressEvent(QMouseEvent *event)
 
 void SnowWindow::mouseMoveEvent(QMouseEvent *event)
 {
+    if (m_suspended)
+        return QWidget::mouseMoveEvent(event);
+    if (m_season != Season::Winter) {
+        m_weather.movePointer(event->position(), event->buttons().testFlag(Qt::LeftButton));
+        return;
+    }
     if (!event->buttons().testFlag(Qt::LeftButton))
         m_scene.cancelDrag();
     if (m_scene.dragging()) {
@@ -367,7 +741,8 @@ void SnowWindow::mouseMoveEvent(QMouseEvent *event)
 
 void SnowWindow::mouseReleaseEvent(QMouseEvent *event)
 {
-    if (event->button() == Qt::LeftButton && m_scene.release(event->position(), pointerTime(event))) {
+    if (!m_suspended && m_season == Season::Winter && event->button() == Qt::LeftButton &&
+        m_scene.release(event->position(), pointerTime(event))) {
         if (m_scene.aiming())
             setCursor(Qt::CrossCursor);
         applyInputRegion();
@@ -400,40 +775,86 @@ bool SnowWindow::event(QEvent *event)
 
 void SnowWindow::startPlow()
 {
-    if (m_interactive && m_season == Season::Winter)
+    if (m_season == Season::Winter && !m_suspended)
         m_scene.startPlow();
 }
 
-// ---------------------------------------------------------------------------
-// Сезоны
-// ---------------------------------------------------------------------------
 void SnowWindow::setSeason(Season season)
 {
     if (m_season == season)
         return;
-    m_season = season;
 
-    // Зимние жесты (перетаскивание кома, прицел) не должны «зависнуть» в другом сезоне.
     m_scene.cancelDrag();
-    if (m_scene.aiming()) {
-        m_scene.cancelAim();
-        unsetCursor();
-    }
+    m_scene.cancelAim();
     m_scene.leave();
     m_scene.leaveWindows();
+    unsetCursor();
 
-    m_inputRegionSet = false;
+    m_season = season;
+    m_weather.setSeason(season);
+    emit seasonalCursorTrackingChanged(!m_suspended && season != Season::Winter);
+    if (season == Season::Winter)
+        initFlakes();
+    refreshLayout();
+    if (season == Season::Winter)
+        m_scene.clearShedSnow();
     applyInputRegion();
-    update();   // полная перерисовка: старый сезон должен исчезнуть, новый — появиться
+    update();
 }
 
 void SnowWindow::setAutumnOptions(const AutumnOptions &options)
 {
-    if ((!options.rain && !options.leaves) || options == m_autumn.options())
+    if (!options.rain && !options.leaves)
         return;
-    m_autumn.setOptions(options);
-    if (m_season == Season::Autumn)
-        update();
+    const AutumnOptions previous = m_weather.options();
+    if (previous.rain == options.rain && previous.leaves == options.leaves)
+        return;
+
+    m_weather.setOptions(options);
+}
+
+void SnowWindow::setSpringRain(bool enabled)
+{
+    m_weather.setSpringRain(enabled);
+}
+
+void SnowWindow::setBubbles(bool enabled)
+{
+    m_weather.setBubbles(enabled);
+    applyInputRegion();
+}
+
+void SnowWindow::setSeasonTool(SeasonTool tool)
+{
+    if (m_season == Season::Winter || m_suspended || !m_interactive)
+        return;
+    m_weather.setTool(tool);
+    if (tool == SeasonTool::Passive)
+        unsetCursor();
+    else
+        setCursor(Qt::CrossCursor);
+    applyInputRegion();
+}
+
+void SnowWindow::setSeasonFan(bool enabled)
+{
+    m_weather.setFan(enabled);
+}
+
+void SnowWindow::setFireflyJar(bool enabled)
+{
+    m_weather.setJar(enabled);
+}
+
+void SnowWindow::startLeafBlower()
+{
+    if (!m_suspended)
+        m_weather.startBlower();
+}
+
+bool SnowWindow::launchPaperBoat()
+{
+    return !m_suspended && m_weather.launchBoat();
 }
 
 // ---------------------------------------------------------------------------
@@ -444,20 +865,78 @@ QRect SnowWindow::flakeRect(const Flake &f)
     return SnowCrystal::bounds(QPointF(f.x, f.y), f.radius);
 }
 
+void SnowWindow::setGarlandsEnabled(bool enabled)
+{
+    m_showGarlands = enabled;
+    updatePanelPopup();
+    const QRegion damage = m_scene.setGarlandsEnabled(enabled);
+    if (m_suspended)
+        updatePausedGarlands();
+    else if (m_season == Season::Winter)
+        updateDamage(damage);
+}
+
+void SnowWindow::setSnowIntensity(int percent)
+{
+    m_scene.setSecondPlowEnabled(percent > 300);
+    const int count = qRound(kNormalFlakeCount * qBound(0, percent, SnowSettings::maxIntensity) / 100.0);
+    const int oldCount = static_cast<int>(m_flakes.size());
+    if (count == oldCount)
+        return;
+
+    QRegion damage;
+    if (!m_suspended && m_season == Season::Winter) {
+        for (int i = count; i < oldCount; ++i) {
+            const QRect &bounds = m_flakes[i].rect;
+            if (rect().intersects(bounds))
+                damage += bounds;
+        }
+    }
+    m_flakeCount = count;
+    m_flakes.resize(count);
+    spawnFlakesFromTop(oldCount);
+    updateDamage(damage - m_hole);
+}
+
+void SnowWindow::setSnowSpeed(int percent)
+{
+    m_snowSpeed = qBound(SnowSettings::minSpeed, percent, SnowSettings::maxSpeed) / 100.0;
+    m_scene.setPlowCadence(m_snowSpeed);
+}
+
+void SnowWindow::setSnowWind(int percent)
+{
+    m_snowWind = qBound(-SnowSettings::maxWind, percent, SnowSettings::maxWind) * Precipitation::windScale;
+}
+
+void SnowWindow::setPrecipitation(const Precipitation::Settings &settings)
+{
+    setSnowIntensity(settings.intensity);
+    setSnowSpeed(settings.speed);
+    setSnowWind(settings.wind);
+    m_weather.setPrecipitation(settings);
+}
+
 void SnowWindow::initFlakes()
 {
-    m_flakes.assign(kFlakeCount, Flake());
-    for (Flake &f : m_flakes) {
-        respawn(f, true);
-        f.x = f.baseX + std::sin(f.phase) * f.swayAmp;
+    m_flakes.resize(m_flakeCount);
+    spawnFlakesFromTop(0);
+}
+
+void SnowWindow::spawnFlakesFromTop(int first)
+{
+    // Разносим первые снежинки по времени, чтобы они не выходили из-за края одной полосой.
+    for (int i = first; i < m_flakeCount; ++i) {
+        Flake &f = m_flakes[i];
+        respawn(f);
+        Precipitation::stage(f, qMax(8.0, f.radius), height(), i - first, m_flakeCount - first);
         f.rect = flakeRect(f);
     }
 }
 
-void SnowWindow::respawn(Flake &f, bool initial)
+void SnowWindow::respawn(Flake &f)
 {
     const double w = qMax(1, width());
-    const double h = qMax(1, height());
 
     const double u = rnd(0.0, 1.0);
     f.radius     = 1.0 + 8.1 * u * u * u;                          // крупные символы встречаются реже
@@ -469,14 +948,41 @@ void SnowWindow::respawn(Flake &f, bool initial)
     f.windFactor = 0.4 + f.radius * 0.18;
     f.glyph      = static_cast<SnowCrystal::Glyph>(QRandomGenerator::global()->bounded(SnowCrystal::glyphCount));
     f.baseX      = rnd(0.0, w);                                    // случайная точка по оси X
-    f.y          = initial ? rnd(0.0, h)                           // старт: по всему экрану
-                           : -rnd(f.radius * 2.0, 60.0);           // респаун: чуть выше верхней границы
+    f.y          = -rnd(f.radius * 2.0, 60.0);
+    f.x          = f.baseX + std::sin(f.phase) * f.swayAmp;
 }
 
 void SnowWindow::tick()
 {
     const double dt = qMin(0.05, m_clock.nsecsElapsed() / 1e9);   // не даём «прыгнуть» после лагов
     m_clock.restart();
+    if (m_suspended) {
+        m_scene.advanceGarlands(dt);
+        updatePausedGarlands();
+        return;
+    }
+    if (m_season != Season::Winter) {
+        if (m_x11) {
+            m_hoverRefresh += dt;
+            if (m_hoverRefresh >= .04) {
+                pollWindowHover();
+                m_hoverRefresh = 0;
+            }
+        }
+        const QRegion damage = m_weather.advance(dt, m_hole.boundingRect());
+        if (m_weather.densePrecipitation())
+            update(damage);
+        else
+            updateDamage(damage);
+        if (m_interactive) {
+            m_inputRefresh += dt;
+            if (m_inputRefresh >= .032) {
+                applyInputRegion();
+                m_inputRefresh = 0;
+            }
+        }
+        return;
+    }
     m_time += dt;
 
     const double w = width();
@@ -484,19 +990,21 @@ void SnowWindow::tick()
     if (w < 1 || h < 1)
         return;
 
-    if (m_season == Season::Autumn) {
-        tickAutumn(dt);
-        return;
-    }
-
     // Общий «ветер»: медленно меняющийся снос в px/с (положительный — вправо).
-    const double wind = 14.0 * std::sin(m_time * 0.25) + 7.0 * std::sin(m_time * 0.73 + 1.3);
+    const double wind = Precipitation::windAt(m_snowWind, m_time);
     const double margin = 30.0;
 
+    const bool dense = m_flakes.size() >= Precipitation::denseCount;
+    Precipitation::DamageTiles tiles(size(), dense);
     QRegion dirty;   // обновляем только те места, где снежинки были и где стали
     const QRect hole = m_hole.boundingRect();
+    const QRect viewport = rect();
     const auto mark = [&](const QRect &damage) {
-        if (!hole.contains(damage))
+        if (!viewport.intersects(damage) || hole.contains(damage))
+            return;
+        if (dense)
+            tiles.mark(damage.intersected(viewport));
+        else
             dirty += damage;
     };
     for (Flake &f : m_flakes) {
@@ -504,28 +1012,12 @@ void SnowWindow::tick()
 
         const double lowerEdge = f.radius * .75;
         const QPointF previous(f.x, f.y + lowerEdge);
-        f.y     += f.speed * dt;
-        f.baseX += wind * f.windFactor * dt;
-        f.phase += f.swayFreq * dt;
-
-        // По горизонтали экран «зациклен» (ветер уносит за край — вернётся с другого).
-        const bool wrapped = f.baseX < -margin || f.baseX > w + margin;
-        if (wrapped) {
-            const double span = w + 2 * margin;
-            f.baseX = std::fmod(f.baseX + margin, span);
-            if (f.baseX < 0)
-                f.baseX += span;
-            f.baseX -= margin;
-        }
-
-        f.x = f.baseX + std::sin(f.phase) * f.swayAmp;   // покачивание по синусоиде
-        const bool landed = m_interactive && !wrapped &&
-                            m_scene.settleSnow(previous, QPointF(f.x, f.y + lowerEdge), f.radius * .32);
+        const bool wrapped = Precipitation::fall(f, dt, m_snowSpeed, wind, w, margin);
+        const bool landed = !wrapped && f.y + lowerEdge >= 0 &&
+                            m_scene.settleSnow(previous, QPointF(f.x, f.y + lowerEdge), f.radius * .32, true, true);
         const bool respawned = landed || f.y - f.radius > h;
-        if (respawned) {
-            respawn(f, false);
-            f.x = f.baseX + std::sin(f.phase) * f.swayAmp;
-        }
+        if (respawned)
+            respawn(f);
         f.rect = flakeRect(f);
         if (!respawned && oldRect == f.rect)
             continue;
@@ -536,30 +1028,25 @@ void SnowWindow::tick()
             mark(f.rect);
         }
     }
-    if (m_interactive) {
-        if (!isWaylandPlatform()) {
-            m_hoverRefresh += dt;
-            if (m_hoverRefresh >= .042) {
-                pollWindowHover();
-                m_hoverRefresh = 0;
-            }
+    if (m_x11) {
+        m_hoverRefresh += dt;
+        if (m_hoverRefresh >= .042) {
+            pollWindowHover();
+            m_hoverRefresh = 0;
         }
-        dirty += m_scene.advance(dt);
+    }
+    dirty += m_scene.advance(dt, wind);
+    if (m_interactive) {
         m_inputRefresh += dt;
         if (m_inputRefresh >= .032) {
             applyInputRegion();
             m_inputRefresh = 0;
         }
     }
-    if (!dirty.isEmpty())
-        update(dirty);
-}
-
-void SnowWindow::tickAutumn(double dt)
-{
-    const QRegion dirty = m_autumn.advance(dt, m_hole.boundingRect());
-    if (!dirty.isEmpty())
-        update(dirty);
+    if (dense)
+        update(dirty + tiles.region());
+    else
+        updateDamage(dirty);
 }
 
 // ---------------------------------------------------------------------------
@@ -568,6 +1055,19 @@ void SnowWindow::tickAutumn(double dt)
 void SnowWindow::paintEvent(QPaintEvent *event)
 {
     QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing);
+    if (m_suspended) {
+        if (!useGarlandLayer()) {
+            for (const auto &garland : m_pausedGarlands) {
+                const QRegion exposed = garland.second & event->region();
+                if (!exposed.isEmpty())
+                    SnowProps::drawGarland(p, garland.first, exposed);
+            }
+        }
+        if (!useGarlandLayer() && !m_popupTimer.isActive() && event->region().intersects(popupGarland(m_popupFrame)))
+            SnowProps::drawGarland(p, m_popupFrame, event->region() & popupGarland(m_popupFrame));
+        return;
+    }
 
     // Снег разрешено рисовать только вне активного окна.
     // (перед paintEvent Qt сам очищает перерисовываемую область до прозрачной,
@@ -580,26 +1080,30 @@ void SnowWindow::paintEvent(QPaintEvent *event)
         p.drawRect(m_hole.boundingRect().adjusted(1, 1, -1, -1));
     }
 
-    p.setRenderHint(QPainter::Antialiasing, true);
     p.setPen(Qt::NoPen);
 
     if (!clip.isEmpty()) {
         p.save();
-        p.setClipRegion(clip);
-        if (m_season == Season::Autumn) {
-            m_autumn.paint(p, clip);
-        } else {
+        p.setClipRegion(QRegion(rect()) - m_hole);
+        if (m_season == Season::Winter) {
+            const bool dense = m_flakes.size() >= Precipitation::denseCount;
             const QRect bounds = clip.boundingRect();
+            const QRect hole = m_hole.boundingRect();
             for (const Flake &f : m_flakes) {
-                if (!f.rect.intersects(bounds) || !clip.intersects(f.rect))
+                if (!f.rect.intersects(bounds) || hole.contains(f.rect) || (!dense && !clip.intersects(f.rect)))
                     continue;
-
                 SnowCrystal::paint(p, QPointF(f.x, f.y), f.radius, f.alpha, f.glyph);
             }
+        } else {
+            m_weather.paint(p, clip);
         }
         p.restore();
     }
 
-    if (m_interactive && m_season == Season::Winter)
+    if (m_season == Season::Winter)
         m_scene.paint(p, event->region());
+    else
+        m_weather.paintLeafOverlays(p, event->region());
+    if (!useGarlandLayer() && !m_popupTimer.isActive() && event->region().intersects(popupGarland(m_popupFrame)))
+        SnowProps::drawGarland(p, m_popupFrame, event->region() & popupGarland(m_popupFrame));
 }

@@ -29,7 +29,7 @@ private Q_SLOTS:
     void pollSurfaces();
 
 private:
-    QRect queryActiveFrame() const;
+    QRect queryActiveFrame(bool &fullscreen) const;
     QRect queryFrame(unsigned long window, bool dock) const;
 
     _XDisplay *m_dpy = nullptr;
@@ -43,11 +43,18 @@ private:
     unsigned long m_atomStacking = 0;
     unsigned long m_atomState = 0;
     unsigned long m_atomHidden = 0;
+    unsigned long m_atomFullscreen = 0;
+    unsigned long m_atomMaximizedHorz = 0;
+    unsigned long m_atomMaximizedVert = 0;
     unsigned long m_atomDesktop = 0;
     unsigned long m_atomCurrentDesktop = 0;
+    unsigned long m_atomShowingDesktop = 0;
+    bool m_showingDesktop = false;
+    unsigned long m_atomAppletPopup = 0;
     QList<long> m_windowTypes;
     QTimer m_timer;
     QTimer m_surfaceTimer;
     QRect m_last;
+    bool m_lastFullscreen = false;
     QList<SnowSurface> m_surfaces;
 };

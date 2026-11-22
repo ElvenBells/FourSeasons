@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 64 64">
+<defs><linearGradient id="b" x2="0" y2="1"><stop stop-color="#273c49"/><stop offset="1" stop-color="#141f2b"/></linearGradient></defs>
+<circle cx="32" cy="32" r="28" fill="url(#b)" stroke="#eba8c4" stroke-width="1.6"/>
+<g transform="translate(32 32)"><g fill="#e998b5" stroke="#ffc4d7" stroke-width="0.7"><ellipse cy="-8.2" rx="4.8" ry="7.4"/><ellipse cy="-8.2" rx="4.8" ry="7.4" transform="rotate(72)"/><ellipse cy="-8.2" rx="4.8" ry="7.4" transform="rotate(144)"/><ellipse cy="-8.2" rx="4.8" ry="7.4" transform="rotate(216)"/><ellipse cy="-8.2" rx="4.8" ry="7.4" transform="rotate(288)"/></g><circle r="3.7" fill="#493043"/><circle r="2.5" fill="#ffd388"/></g>
+</svg>
