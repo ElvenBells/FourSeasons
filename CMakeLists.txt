@@ -54,7 +54,7 @@ if(UNIX AND NOT APPLE)
     list(APPEND SNOW_DEFS SNOW_HAS_KWIN)
 
     # Слой поверх всплывающего меню Plasma на Wayland.
-    find_package(LayerShellQt QUIET)
+    find_package(LayerShellQt 6 QUIET)
     if(TARGET LayerShellQt::Interface)
         list(APPEND SNOW_SOURCES src/PanelGarland.cpp)
         list(APPEND SNOW_LIBS LayerShellQt::Interface)
